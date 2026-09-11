@@ -3,6 +3,7 @@
 #include "core/dtype.h"
 
 #include <algorithm>
+#include <cstdio>
 #include <exception>
 #include <limits>
 #include <stdexcept>

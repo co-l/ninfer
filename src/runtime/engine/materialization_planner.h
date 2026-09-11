@@ -7,6 +7,7 @@
 #include <algorithm>
 #include <array>
 #include <chrono>
+#include <cstdio>
 #include <cstdint>
 #include <limits>
 #include <optional>
@@ -226,6 +227,32 @@ public:
 
         Incumbent incumbent;
         std::uint32_t targets_evaluated = static_cast<std::uint32_t>(candidates.size());
+        std::vector<const MaterializationOwnerPolicy*> preferred_owners;
+        preferred_owners.reserve(pressure.owner_policy.size());
+        for (const MaterializationOwnerPolicy& policy : pressure.owner_policy) {
+            preferred_owners.push_back(&policy);
+        }
+        std::sort(preferred_owners.begin(), preferred_owners.end(),
+                  [](const auto* left, const auto* right) {
+                      return std::tuple{
+                                 left->selected_hit_count,
+                                 left->explicit_shared_credit ? 1U : 0U,
+                                 left->private_retention_weight,
+                                 left->last_hit_epoch,
+                                 left->owner.value,
+                             } < std::tuple{
+                                     right->selected_hit_count,
+                                     right->explicit_shared_credit ? 1U : 0U,
+                                     right->private_retention_weight,
+                                     right->last_hit_epoch,
+                                     right->owner.value,
+                                 };
+                  });
+        std::vector<PlanningOwnerId> preferred_owner_ids;
+        preferred_owner_ids.reserve(preferred_owners.size());
+        for (const MaterializationOwnerPolicy* policy : preferred_owners) {
+            preferred_owner_ids.push_back(policy->owner);
+        }
         if (identity_best) {
             incumbent        = std::move(*identity_best);
             incumbent.target = session.identity_target(candidates[incumbent.candidate_index].id);
@@ -253,323 +280,44 @@ public:
             mark_target(assessment.stable_target_ordinal, kTargetDiscovered | kTargetAssessed);
         }
 
-        const Clock::time_point search_started = Clock::now();
-        const std::uint64_t search_budget_ns =
-            std::min<std::uint64_t>(5'000'000ULL, incumbent.cost.total_ns / 20U);
-        const std::uint64_t guided_watchdog_ns = search_budget_ns;
-        std::uint64_t maximum_step_ns          = 0;
-        std::uint32_t optional_targets         = 0;
-        std::uint32_t guided_assessments       = 0;
-        MaterializationStopReason stop_reason  = MaterializationStopReason::QueueExhausted;
-        bool budget_exhausted                  = false;
-
+        // Deterministic value-ranked planning: for every candidate that cannot be
+        // materialized identically, build its single value-ranked pressure plan
+        // (sort, not search) and keep the best by cost. No search, no budget, no
+        // fallback races.
+        const Clock::time_point deterministic_started = Clock::now();
+        MaterializationStopReason stop_reason         = MaterializationStopReason::QueueExhausted;
+        bool budget_exhausted                         = false;
         for (const IdentityRoot& root : roots) {
             if (!root.expandable) { continue; }
-            QueueEntry entry;
-            entry.target            = session.identity_target(candidates[root.candidate_index].id);
-            entry.candidate_index   = root.candidate_index;
-            entry.lower_bound_ns    = root.lower_bound_ns;
-            entry.remaining_prefill = identity_costs_[root.candidate_index].remaining_text_prefill;
-            entry.remaining_vision_prefill =
-                identity_costs_[root.candidate_index].remaining_vision_prefill;
-            entry.reused_prompt_tokens = identity_costs_[root.candidate_index].reused_prompt_tokens;
-            entry.current_session_binding =
-                identity_costs_[root.candidate_index].current_session_binding;
-            entry.candidate_ordinal     = identity_costs_[root.candidate_index].candidate_ordinal;
-            entry.stable_target_ordinal = root.candidate_index;
-            mark_target(entry.stable_target_ordinal, kTargetDiscovered | kTargetAssessed);
-            queue_push(entry);
-            const PressureTargetGuidance guidance = session.guidance(entry.target);
-            if (guidance.candidate != candidates[root.candidate_index].id) {
-                throw std::logic_error("pressure guidance changed admission candidate");
+            const std::optional<PressureTargetHandle> deterministic =
+                session.deterministic_target(candidates[root.candidate_index].id,
+                                             preferred_owner_ids);
+            if (!deterministic) {
+                continue;
             }
-            guided_insert(GuidedEntry{
-                .target          = entry.target,
-                .candidate_index = root.candidate_index,
-                .lower_bound_ns  = root.lower_bound_ns,
-                .guidance        = fold_guidance(candidates[root.candidate_index], guidance,
-                                                 pressure.owner_policy, machine_cost),
-                .already_assessed_expandable = true,
-            });
-        }
-
-        const auto make_queue_entry = [](PressureTargetHandle target, std::uint32_t candidate_index,
-                                         const PressureTargetAssessment& assessment,
-                                         const FoldedCost& cost) {
-            return QueueEntry{
-                .target                    = target,
-                .candidate_index           = candidate_index,
-                .lower_bound_ns            = cost.lower_bound_ns,
-                .affected_selected_hits    = cost.affected_selected_hits,
-                .newest_affected_hit_epoch = cost.newest_affected_hit_epoch,
-                .owner_evictions           = cost.owner_evictions,
-                .checkpoint_drops          = cost.checkpoint_drops,
-                .copy_operations           = cost.copy_operations,
-                .transferred_bytes         = cost.transferred_bytes,
-                .remaining_prefill         = cost.remaining_text_prefill,
-                .remaining_vision_prefill  = cost.remaining_vision_prefill,
-                .reused_prompt_tokens      = cost.reused_prompt_tokens,
-                .current_session_binding   = cost.current_session_binding,
-                .candidate_ordinal         = cost.candidate_ordinal,
-                .stable_target_ordinal     = assessment.stable_target_ordinal,
-            };
-        };
-
-        const auto assess_target =
-            [&](PressureTargetHandle target, std::uint32_t expected_candidate,
-                std::uint32_t expected_ordinal) -> std::optional<QueueEntry> {
-            AssessedPressureTarget assessed            = session.assess(target);
+            AssessedPressureTarget assessed            = session.assess(*deterministic);
             const PressureTargetAssessment& assessment = assessed.assessment();
-            if (assessment.candidate != candidates[expected_candidate].id ||
-                candidate_index_for(assessment.candidate) != expected_candidate ||
-                assessment.stable_target_ordinal != expected_ordinal) {
-                throw std::logic_error("pressure target changed admission candidate");
+            if (assessment.candidate != candidates[root.candidate_index].id) {
+                throw std::logic_error("deterministic target changed admission candidate");
             }
-            mark_target(assessment.stable_target_ordinal, kTargetDiscovered | kTargetAssessed);
             ++targets_evaluated;
             planning_saturating_add(projection_work, assessment.projection_work);
             const FoldedCost cost =
-                fold_assessment(candidates[expected_candidate], assessment, pressure.owner_policy,
-                                pressure.checkpoint_policy, machine_cost);
+                fold_assessment(candidates[root.candidate_index], assessment,
+                                pressure.owner_policy, pressure.checkpoint_policy, machine_cost);
             std::optional<LogicalGoal> goal;
             if (assessment.physical_status == MaterializationPhysicalStatus::Feasible) {
                 goal = logical_goal(assessment.candidate, assessment.source_mode,
                                     assessment.owner_outcomes);
             }
-            if (goal && !assessment.root_maximal) {
-                candidate_seed_complete_[expected_candidate] = true;
-            }
-            if (goal && cost.less(incumbent.cost)) {
-                incumbent = make_incumbent(target, expected_candidate, assessment,
+            if (!goal) { continue; }
+            if (cost.less(incumbent.cost)) {
+                incumbent = make_incumbent(*deterministic, root.candidate_index, assessment,
                                            std::move(assessed), cost, *goal);
             }
-            if (!assessment.expandable) { return std::nullopt; }
-            QueueEntry entry = make_queue_entry(target, expected_candidate, assessment, cost);
-            queue_push(entry);
-            return entry;
-        };
-
-        const auto expand_target = [&](const QueueEntry& parent) {
-            if (target_marked(parent.stable_target_ordinal, kTargetExpanded)) { return true; }
-            if (optional_targets >= kTargetBudget) { return false; }
-            auto prepared = session.prepare_expansion(parent.target);
-            if (prepared.new_canonical_count() > kTargetBudget - optional_targets) {
-                session.discard_expansion(std::move(prepared));
-                return false;
-            }
-            const auto children = session.commit_expansion(std::move(prepared));
-            optional_targets += children.new_canonical_count;
-            mark_target(parent.stable_target_ordinal, kTargetExpanded);
-            for (const PressureTargetHandle child : children.children) {
-                const PressureTargetGuidance guidance = session.guidance(child);
-                if (guidance.candidate != candidates[parent.candidate_index].id) {
-                    throw std::logic_error("pressure guidance changed admission candidate");
-                }
-                const std::uint32_t candidate_index = candidate_index_for(guidance.candidate);
-                if (target_marked(guidance.stable_target_ordinal, kTargetDiscovered)) { continue; }
-                mark_target(guidance.stable_target_ordinal, kTargetDiscovered);
-                const std::uint64_t lower_bound_ns = std::max(
-                    identity_costs_[candidate_index].lower_bound_ns, parent.lower_bound_ns);
-                const GuidanceCost cost = fold_guidance(candidates[candidate_index], guidance,
-                                                        pressure.owner_policy, machine_cost);
-                PendingEntry pending{
-                    .target          = child,
-                    .candidate_index = candidate_index,
-                    .lower_bound_ns  = lower_bound_ns,
-                    .guidance        = cost,
-                };
-                pending_push(pending);
-                if (!candidate_seed_complete_[candidate_index]) {
-                    guided_insert(GuidedEntry{
-                        .target          = child,
-                        .candidate_index = candidate_index,
-                        .lower_bound_ns  = lower_bound_ns,
-                        .guidance        = cost,
-                    });
-                }
-            }
-            return true;
-        };
-
-        const auto candidate_needs_seed = [&](std::uint32_t candidate_index) {
-            return candidate_index < roots.size() && roots[candidate_index].expandable &&
-                   !candidate_seed_complete_[candidate_index];
-        };
-        const auto has_open_seed = [&] {
-            return std::any_of(roots.begin(), roots.end(), [&](const IdentityRoot& root) {
-                return candidate_needs_seed(root.candidate_index);
-            });
-        };
-
-        std::vector<const MaterializationOwnerPolicy*> preferred_owners;
-        preferred_owners.reserve(pressure.owner_policy.size());
-        for (const MaterializationOwnerPolicy& policy : pressure.owner_policy) {
-            preferred_owners.push_back(&policy);
-        }
-        std::sort(preferred_owners.begin(), preferred_owners.end(),
-                  [](const auto* left, const auto* right) {
-                      return std::tuple{
-                                 left->selected_hit_count,
-                                 left->explicit_shared_credit ? 1U : 0U,
-                                 left->private_retention_weight,
-                                 left->last_hit_epoch,
-                                 left->owner.value,
-                             } < std::tuple{
-                                     right->selected_hit_count,
-                                     right->explicit_shared_credit ? 1U : 0U,
-                                     right->private_retention_weight,
-                                     right->last_hit_epoch,
-                                     right->owner.value,
-                                 };
-                  });
-        std::vector<PlanningOwnerId> preferred_owner_ids;
-        preferred_owner_ids.reserve(preferred_owners.size());
-        for (const MaterializationOwnerPolicy* policy : preferred_owners) {
-            preferred_owner_ids.push_back(policy->owner);
         }
 
-        std::vector<IdentityRoot> closure_order;
-        closure_order.reserve(roots.size());
-        for (const IdentityRoot& root : roots) {
-            if (candidate_needs_seed(root.candidate_index)) { closure_order.push_back(root); }
-        }
-        std::sort(closure_order.begin(), closure_order.end(),
-                  [](const IdentityRoot& left, const IdentityRoot& right) {
-                      return std::tuple{left.lower_bound_ns, left.candidate_index} <
-                             std::tuple{right.lower_bound_ns, right.candidate_index};
-                  });
-        for (const IdentityRoot& root : closure_order) {
-            if (!candidate_needs_seed(root.candidate_index) ||
-                elapsed_ns(search_started, Clock::now()) >= guided_watchdog_ns ||
-                optional_targets >= kTargetBudget) {
-                continue;
-            }
-            const Clock::time_point step_started              = Clock::now();
-            const std::optional<PressureTargetHandle> closure = session.guided_closure_target(
-                candidates[root.candidate_index].id, preferred_owner_ids);
-            maximum_step_ns = std::max(maximum_step_ns, elapsed_ns(step_started, Clock::now()));
-            if (!closure) { continue; }
-            const PressureTargetGuidance closure_guidance = session.guidance(*closure);
-            if (closure_guidance.candidate != candidates[root.candidate_index].id) {
-                throw std::logic_error("guided closure changed admission candidate");
-            }
-            if (target_marked(closure_guidance.stable_target_ordinal, kTargetAssessed)) {
-                continue;
-            }
-            if (!target_marked(closure_guidance.stable_target_ordinal, kTargetDiscovered)) {
-                mark_target(closure_guidance.stable_target_ordinal, kTargetDiscovered);
-                ++optional_targets;
-            }
-            const Clock::time_point assessment_started = Clock::now();
-            (void)assess_target(*closure, root.candidate_index,
-                                closure_guidance.stable_target_ordinal);
-            ++guided_assessments;
-            maximum_step_ns =
-                std::max(maximum_step_ns, elapsed_ns(assessment_started, Clock::now()));
-        }
-
-        // Build one ordinary feasible seed per expandable candidate. Estimated machine cost orders
-        // independent beams but never excludes a candidate or certifies an incumbent.
-        while (has_open_seed() && !guided_.empty() &&
-               guided_assessments < kGuidedAssessmentBudget) {
-            if (elapsed_ns(search_started, Clock::now()) >= guided_watchdog_ns) { break; }
-            const GuidedEntry next = guided_pop();
-            if (!candidate_needs_seed(next.candidate_index) ||
-                target_marked(next.guidance.stable_target_ordinal, kTargetExpanded)) {
-                continue;
-            }
-            std::optional<QueueEntry> exact;
-            if (next.already_assessed_expandable) {
-                exact = QueueEntry{
-                    .target          = next.target,
-                    .candidate_index = next.candidate_index,
-                    .lower_bound_ns  = next.lower_bound_ns,
-                    .remaining_prefill =
-                        identity_costs_[next.candidate_index].remaining_text_prefill,
-                    .remaining_vision_prefill =
-                        identity_costs_[next.candidate_index].remaining_vision_prefill,
-                    .reused_prompt_tokens =
-                        identity_costs_[next.candidate_index].reused_prompt_tokens,
-                    .current_session_binding =
-                        identity_costs_[next.candidate_index].current_session_binding,
-                    .candidate_ordinal = identity_costs_[next.candidate_index].candidate_ordinal,
-                    .stable_target_ordinal = next.guidance.stable_target_ordinal,
-                };
-            } else if (!target_marked(next.guidance.stable_target_ordinal, kTargetAssessed)) {
-                const Clock::time_point step_started = Clock::now();
-                exact = assess_target(next.target, next.candidate_index,
-                                      next.guidance.stable_target_ordinal);
-                ++guided_assessments;
-                maximum_step_ns = std::max(maximum_step_ns, elapsed_ns(step_started, Clock::now()));
-            }
-            if (!exact || !candidate_needs_seed(next.candidate_index)) { continue; }
-            if (elapsed_ns(search_started, Clock::now()) >= guided_watchdog_ns) { break; }
-            const Clock::time_point step_started = Clock::now();
-            if (!expand_target(*exact)) { break; }
-            maximum_step_ns = std::max(maximum_step_ns, elapsed_ns(step_started, Clock::now()));
-        }
-
-        for (;;) {
-            while (!queue_.empty() &&
-                   target_marked(queue_.front().stable_target_ordinal, kTargetExpanded)) {
-                (void)queue_pop();
-            }
-            while (
-                !pending_.empty() &&
-                target_marked(pending_.front().guidance.stable_target_ordinal, kTargetAssessed)) {
-                (void)pending_pop();
-            }
-            if (queue_.empty() && pending_.empty()) {
-                stop_reason = MaterializationStopReason::QueueExhausted;
-                break;
-            }
-            const std::uint64_t queue_bound   = queue_.empty()
-                                                    ? std::numeric_limits<std::uint64_t>::max()
-                                                    : queue_.front().lower_bound_ns;
-            const std::uint64_t pending_bound = pending_.empty()
-                                                    ? std::numeric_limits<std::uint64_t>::max()
-                                                    : pending_.front().lower_bound_ns;
-            const std::uint64_t next_bound    = std::min(queue_bound, pending_bound);
-            const std::uint64_t elapsed       = elapsed_ns(search_started, Clock::now());
-            if (elapsed >= search_budget_ns) {
-                stop_reason      = MaterializationStopReason::TimeBudget;
-                budget_exhausted = true;
-                break;
-            }
-            const std::uint64_t possible_improvement =
-                incumbent.cost.total_ns > next_bound ? incumbent.cost.total_ns - next_bound : 0;
-            if (possible_improvement != 0 && maximum_step_ns != 0 &&
-                maximum_step_ns >= possible_improvement) {
-                stop_reason = MaterializationStopReason::ValueOfNextExpansion;
-                break;
-            }
-
-            const bool assess_pending =
-                !pending_.empty() && (queue_.empty() || pending_bound <= queue_bound);
-            const Clock::time_point step_started = Clock::now();
-            if (assess_pending) {
-                const PendingEntry next = pending_pop();
-                if (!target_marked(next.guidance.stable_target_ordinal, kTargetAssessed)) {
-                    (void)assess_target(next.target, next.candidate_index,
-                                        next.guidance.stable_target_ordinal);
-                }
-            } else {
-                if (optional_targets >= kTargetBudget) {
-                    stop_reason      = MaterializationStopReason::TargetBudget;
-                    budget_exhausted = true;
-                    break;
-                }
-                const QueueEntry parent = queue_pop();
-                if (!expand_target(parent)) {
-                    stop_reason      = MaterializationStopReason::ExpansionCapacity;
-                    budget_exhausted = true;
-                    break;
-                }
-            }
-            maximum_step_ns = std::max(maximum_step_ns, elapsed_ns(step_started, Clock::now()));
-        }
-
-        const std::uint64_t search_elapsed_ns = elapsed_ns(search_started, Clock::now());
+        const std::uint64_t search_elapsed_ns = elapsed_ns(deterministic_started, Clock::now());
         if (!incumbent.assessed) {
             AssessedPressureTarget assessed            = session.assess(incumbent.target);
             const PressureTargetAssessment& assessment = assessed.assessment();
@@ -624,9 +372,9 @@ public:
     }
 
 private:
-    static constexpr std::uint32_t kTargetBudget           = 4096;
-    static constexpr std::uint32_t kGuidedBeamWidth        = 16;
-    static constexpr std::uint32_t kGuidedAssessmentBudget = 32;
+    static constexpr std::uint32_t kTargetBudget           = 262144;
+    static constexpr std::uint32_t kGuidedBeamWidth        = 64;
+    static constexpr std::uint32_t kGuidedAssessmentBudget = 256;
 
     struct FoldedCost {
         std::uint64_t now_ns                    = 0;
@@ -647,7 +395,14 @@ private:
         std::uint32_t target_ordinal            = 0;
 
         [[nodiscard]] auto key() const noexcept {
+            // Reprocessing (re-prefill of already-processed context) is the hard rule to
+            // avoid: a context that has been processed must never be reprocessed unless
+            // eviction is truly unavoidable. Rank remaining prefill (text + vision) above
+            // the time estimate so a full host restore is always preferred over a cheaper
+            // partial re-prefill.
             return std::tuple{
+                remaining_text_prefill,
+                remaining_vision_prefill,
                 total_ns,
                 affected_selected_hits,
                 newest_affected_hit_epoch,
@@ -655,8 +410,6 @@ private:
                 checkpoint_drops,
                 copy_operations,
                 transferred_bytes,
-                remaining_text_prefill,
-                remaining_vision_prefill,
                 std::numeric_limits<std::uint32_t>::max() - reused_prompt_tokens,
                 current_session_binding ? 0U : 1U,
                 candidate_ordinal,

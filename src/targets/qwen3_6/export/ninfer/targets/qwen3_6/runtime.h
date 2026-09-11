@@ -552,6 +552,12 @@ public:
     [[nodiscard]] std::optional<PressureTargetHandle>
     guided_closure_target(runtime::PlanningCandidateId candidate,
                           std::span<const runtime::PlanningOwnerId> preferred_owner_ids);
+    [[nodiscard]] std::optional<PressureTargetHandle>
+    graceful_fallback_target(runtime::PlanningCandidateId candidate,
+                             std::span<const runtime::PlanningOwnerId> preferred_owner_ids);
+    [[nodiscard]] std::optional<PressureTargetHandle>
+    deterministic_target(runtime::PlanningCandidateId candidate,
+                         std::span<const runtime::PlanningOwnerId> preferred_owner_ids);
     [[nodiscard]] runtime::PressureTargetGuidance guidance(PressureTargetHandle target);
     [[nodiscard]] AssessedPressureTarget<Variant> assess(PressureTargetHandle target);
     [[nodiscard]] PreparedPressureExpansion<Variant> prepare_expansion(PressureTargetHandle parent);
