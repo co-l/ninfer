@@ -17,6 +17,7 @@
 #include <algorithm>
 #include <array>
 #include <chrono>
+#include <cstdio>
 #include <exception>
 #include <iterator>
 #include <limits>
@@ -1292,7 +1293,9 @@ ProgramImplCore::materialization_source_protection(const ResourceCandidateState&
             return std::nullopt;
         }
         const SequenceState& source = continuation_states[admission.source_index];
-        if (!source.kv) { return std::nullopt; }
+        if (!source.kv) {
+            return std::nullopt;
+        }
         kv                              = &*source.kv;
         protection.private_source_index = admission.source_index;
         protection.state = selected_state(source, admission.reuse, admission.selected_checkpoint);
@@ -2159,7 +2162,9 @@ bool ProgramImplCore::pressure_checkpoint_recovery_impacts(
 
     for (std::size_t index = 0; index < private_owners.size(); ++index) {
         const ContinuationHandle* handle = private_owners[index];
-        if (handle == nullptr || !valid_continuation(*handle)) { return false; }
+        if (handle == nullptr || !valid_continuation(*handle)) {
+            return false;
+        }
         const SequenceState& sequence = continuation_states[ContractAccess::index(*handle)];
         projected_owners.push_back(OwnerProjection{
             .sequence = &sequence,
@@ -3505,10 +3510,9 @@ std::optional<detail::PressureTargetProjection> ProgramImplCore::evaluate_pressu
         const std::size_t stride =
             plan_host_kv_page_layout(pages.physical_pool().geometry()).page_stride;
         for (const PressureSelectedPage& item : selected) {
-            if (pages.address_references(item.page) != item.references ||
-                pages.writer_references(item.page) != 0 || pages.source_pins(item.page) != 0) {
-                continue;
-            }
+            if (pages.source_pins(item.page) != 0) { continue; }
+            if (pages.writer_references(item.page) != 0) { continue; }
+            if (pages.address_references(item.page) != item.references) { continue; }
             const PressurePageScratchSlot* projected = find_pressure_page_scratch(pages, item.page);
             const bool device_resident               = projected != nullptr && projected->projected
                                                            ? projected->device
@@ -3658,7 +3662,9 @@ bool ProgramImplCore::compose_pressure_candidate(
                       planning_owner) != details.pressure_owner_ids.end()) {
             throw std::invalid_argument("materialization pressure owner is invalid");
         }
-        if (!valid_continuation(*owner)) { return false; }
+        if (!valid_continuation(*owner)) {
+            return false;
+        }
         const std::uint32_t index      = ContractAccess::index(*owner);
         const std::uint64_t generation = ContractAccess::epoch(*owner);
         if ((details.has_source && index == details.source_index &&
@@ -3684,7 +3690,9 @@ bool ProgramImplCore::compose_pressure_candidate(
         pressure_needs_transfer =
             pressure_needs_transfer || !expected.transfer_requirements.empty();
         const SequenceState& pressure_owner = continuation_states[index];
-        if (!pressure_owner.kv) { return false; }
+        if (!pressure_owner.kv) {
+            return false;
+        }
         append_kv_actions(*text_kv_addresses, *text_kv_pages, pressure_owner.kv->text,
                           expected.main_kv_changes, private_host_requests);
         if (!expected.backend_kv_changes.empty()) {
@@ -3713,7 +3721,9 @@ bool ProgramImplCore::compose_pressure_candidate(
                       planning_owner) != details.shared_pressure_owner_ids.end()) {
             throw std::invalid_argument("materialization shared pressure owner is invalid");
         }
-        if (!valid_shared_prefix(*owner)) { return false; }
+        if (!valid_shared_prefix(*owner)) {
+            return false;
+        }
         const std::uint32_t index      = ContractAccess::index(*owner);
         const std::uint64_t generation = ContractAccess::epoch(*owner);
         if ((details.has_shared_source && index == details.shared_source_index &&
@@ -3741,7 +3751,9 @@ bool ProgramImplCore::compose_pressure_candidate(
         pressure_needs_transfer =
             pressure_needs_transfer || !expected.transfer_requirements.empty();
         const SharedPrefixState& pressure_owner = shared_prefix_states[index];
-        if (!pressure_owner.kv) { return false; }
+        if (!pressure_owner.kv) {
+            return false;
+        }
         append_kv_actions(*text_kv_addresses, *text_kv_pages, pressure_owner.kv->text,
                           expected.main_kv_changes, shared_host_requests);
         if (!expected.backend_kv_changes.empty()) {
@@ -3756,7 +3768,9 @@ bool ProgramImplCore::compose_pressure_candidate(
     const std::optional<detail::PressureTargetProjection> projection = evaluate_pressure_target(
         &*protection, pressure_owners, details.pressure_options, shared_pressure_owners,
         details.shared_pressure_options, &host_last_reference_releases);
-    if (!projection) { return false; }
+    if (!projection) {
+        return false;
+    }
     const detail::PhysicalResources& removed = projection->unique_object_delta.removed;
     const detail::PhysicalResources& added   = projection->unique_object_delta.added;
 
@@ -6824,6 +6838,35 @@ ProgramImplCore::guided_materialization_deficit(const ResourceCandidateState& ad
     const detail::PhysicalResources required =
         checked_resource_sum(physical_occupancy(), projected_peak);
     return positive_resource_difference(required, admission_capacity());
+}
+
+// Mirrors compose_pressure_candidate's Host extent admission for the planner's cheap
+// model: reports whether the given demote page-counts (main and backend) fit the Host
+// arena's CURRENT free extents. The byte-total model can be optimistic when free space
+// is fragmented; this is the allocator's real answer (releases only add space, so
+// asking without the plan's releases is conservative and safe).
+bool ProgramImplCore::host_kv_requests_fit(std::span<const std::uint32_t> main_pages,
+                                           std::span<const std::uint32_t> back_pages) const {
+    std::vector<HostKVAllocationRequest> requests;
+    requests.reserve(main_pages.size() + back_pages.size());
+    std::vector<HostKVPageLayout> layouts;
+    layouts.reserve(2);
+    if (text_kv_pages) {
+        layouts.push_back(plan_host_kv_page_layout(text_kv_pages->physical_pool().geometry()));
+        for (const std::uint32_t pages : main_pages) {
+            if (pages != 0) { requests.push_back({.layout = &layouts.back(), .pages = pages}); }
+        }
+    }
+    if (backend_kv_pages) {
+        layouts.push_back(plan_host_kv_page_layout(backend_kv_pages->physical_pool().geometry()));
+        for (const std::uint32_t pages : back_pages) {
+            if (pages != 0) { requests.push_back({.layout = &layouts.back(), .pages = pages}); }
+        }
+    }
+    if (requests.empty()) { return true; }
+    if (host_kv_extents == nullptr) { return false; }
+    const std::span<const HostKVPageReplicaRelease> no_releases;
+    return host_kv_extents->can_allocate_after_page_releases(no_releases, requests);
 }
 
 bool ProgramImplCore::physical_peak_fits(detail::PhysicalResources peak) const noexcept {

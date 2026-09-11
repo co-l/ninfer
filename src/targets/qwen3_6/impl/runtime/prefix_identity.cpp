@@ -410,10 +410,12 @@ std::array<std::uint64_t, 2> PrefixShortlistDigests::at(std::size_t frontier) co
 bool prefix_matches(const PreparedPromptData& prompt, std::span<const TokenId> resident_tokens,
                     const ResidentPrefixIdentity& resident_identity, std::size_t count) {
     if (count > prompt.token_ids.size() || count > resident_tokens.size()) { return false; }
-    return std::equal(prompt.token_ids.begin(),
-                      prompt.token_ids.begin() + static_cast<std::ptrdiff_t>(count),
-                      resident_tokens.begin()) &&
-           resident_identity.matches(prompt, count);
+    const bool token_eq = std::equal(prompt.token_ids.begin(),
+                                     prompt.token_ids.begin() +
+                                         static_cast<std::ptrdiff_t>(count),
+                                     resident_tokens.begin());
+    const bool identity_eq = resident_identity.matches(prompt, count);
+    return token_eq && identity_eq;
 }
 
 } // namespace ninfer::targets::qwen3_6::detail

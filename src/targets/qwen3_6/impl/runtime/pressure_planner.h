@@ -3,6 +3,7 @@
 #include "targets/qwen3_6/impl/runtime/program.h"
 
 #include <array>
+#include <cstdio>
 #include <limits>
 #include <tuple>
 
@@ -146,7 +147,7 @@ namespace ninfer::targets::qwen3_6::detail {
 
 namespace planning_detail {
 
-inline constexpr std::size_t kOptionalTargetCapacity = 4096;
+inline constexpr std::size_t kOptionalTargetCapacity = 262144;
 
 inline void hash_mix(std::uint64_t& hash, std::uint64_t value) noexcept {
     hash ^= value;
@@ -799,6 +800,701 @@ PressurePlanningSessionImpl<NINFER_QWEN36_VARIANT>::construction_target(
     result.generation_ = generation;
     result.index_      = index;
     return result;
+}
+
+inline std::optional<qwen3_6::PressureTargetHandle>
+PressurePlanningSessionImpl<NINFER_QWEN36_VARIANT>::graceful_fallback_target(
+    runtime::PlanningCandidateId admission,
+    std::span<const runtime::PlanningOwnerId> preferred_owner_ids) {
+    if (scratch_live) { throw std::logic_error("pressure expansion scratch is still live"); }
+    const std::uint32_t selected_candidate = candidate_index(admission);
+    populate_options(selected_candidate);
+    CandidateOptions& options       = candidate_options[selected_candidate];
+    const CandidateState& candidate = *candidates[selected_candidate].state;
+    const std::optional<typename Core::MaterializationSourceProtection> protection =
+        program->materialization_source_protection(candidate);
+    if (!protection) { return std::nullopt; }
+
+    std::vector<std::size_t> victim_order;
+    victim_order.reserve(options.victims.size());
+    const auto append_victim = [&](std::size_t victim_index) {
+        if (std::find(victim_order.begin(), victim_order.end(), victim_index) ==
+            victim_order.end()) {
+            victim_order.push_back(victim_index);
+        }
+    };
+    for (const runtime::PlanningOwnerId id : preferred_owner_ids) {
+        const auto found =
+            std::find_if(options.victims.begin(), options.victims.end(), [&](const auto& victim) {
+                return victim.owner_index < owners.size() && owners[victim.owner_index].id == id;
+            });
+        if (found != options.victims.end()) {
+            append_victim(static_cast<std::size_t>(found - options.victims.begin()));
+        }
+    }
+    for (std::size_t index = 0; index < options.victims.size(); ++index) { append_victim(index); }
+
+    const auto projected_residual = [&](std::span<const std::uint16_t> target_choices) {
+        detail::PhysicalDelta pressure;
+        for (std::size_t index = 0; index < options.victims.size(); ++index) {
+            const std::uint16_t choice = target_choices[index];
+            if (choice == 0) { continue; }
+            if (choice > options.victims[index].decisions.size()) {
+                throw std::logic_error("graceful pressure choice is invalid");
+            }
+            const PressureDecision& decision = options.victims[index].decisions[choice - 1U];
+            pressure.added = NINFER_QWEN36_RUNTIME_NS::planning_resource_sum(
+                pressure.added, decision.effect.added);
+            pressure.removed = NINFER_QWEN36_RUNTIME_NS::planning_resource_sum(
+                pressure.removed, decision.effect.removed);
+        }
+        return program->guided_materialization_deficit(candidate, pressure);
+    };
+    const auto feasible = [&](std::span<const std::uint16_t> target_choices) {
+        return projected_residual(target_choices) == detail::PhysicalResources{};
+    };
+
+    choice_scratch.assign(options.victims.size(), 0);
+    for (std::size_t index = 0; index < options.victims.size(); ++index) {
+        choice_scratch[index] = options.victims[index].eviction_choice;
+    }
+
+    const auto choice_destructiveness = [&](std::size_t victim_index, std::uint16_t choice) {
+        std::uint64_t score = 0;
+        if (choice != 0) {
+            const PressureDecision& decision = options.victims[victim_index].decisions[choice - 1U];
+            score += decision.evicts_continuation ? 16ULL : 0ULL;
+            score += decision.checkpoint_drops;
+        }
+        return score;
+    };
+
+    for (auto it = victim_order.rbegin(); it != victim_order.rend(); ++it) {
+        const std::size_t victim_index = *it;
+        if (choice_scratch[victim_index] == 0) { continue; }
+        std::vector<PressureDecision>& decisions = options.victims[victim_index].decisions;
+        {
+            // Generate intermediate decisions (state/KV demotes) on demand so the
+            // fallback can retain victims that only need a demote instead of a
+            // whole-context drop (e.g. device state-slot pressure).
+            const PressureDecision* current = nullptr;
+            if (choice_scratch[victim_index] <= decisions.size()) {
+                current = &decisions[choice_scratch[victim_index] - 1U];
+            }
+            const detail::PhysicalResources residual = projected_residual(choice_scratch);
+            for (PressureDecision& successor :
+                 pressure_successors(options.victims[victim_index], residual, *protection,
+                                     current)) {
+                if (std::find(decisions.begin(), decisions.end(), successor) != decisions.end()) {
+                    continue;
+                }
+                if (decisions.size() >= std::numeric_limits<std::uint16_t>::max()) { break; }
+                decisions.push_back(std::move(successor));
+            }
+        }
+        std::uint16_t best_choice = choice_scratch[victim_index];
+        std::uint64_t best_score  = choice_destructiveness(victim_index, best_choice);
+        for (std::uint16_t choice = 0; choice <= decisions.size(); ++choice) {
+            if (choice == best_choice) { continue; }
+            choice_scratch[victim_index] = choice;
+            if (!feasible(choice_scratch)) { continue; }
+            const std::uint64_t score = choice_destructiveness(victim_index, choice);
+            if (score < best_score) {
+                best_score  = score;
+                best_choice = choice;
+            }
+        }
+        choice_scratch[victim_index] = best_choice;
+    }
+
+    TargetNode* existing = find_target(selected_candidate, choice_scratch);
+    const std::size_t maximum =
+        candidates.size() + 1U + planning_detail::kOptionalTargetCapacity;
+    if (existing == nullptr && targets.size() >= maximum) { return std::nullopt; }
+    const std::uint32_t target_index =
+        existing != nullptr ? static_cast<std::uint32_t>(existing - targets.data())
+                            : intern_target(selected_candidate, choice_scratch);
+    qwen3_6::PressureTargetHandle handle;
+    handle.session_    = this;
+    handle.generation_ = generation;
+    handle.index_      = target_index;
+    return handle;
+}
+
+inline std::optional<qwen3_6::PressureTargetHandle>
+PressurePlanningSessionImpl<NINFER_QWEN36_VARIANT>::deterministic_target(
+    runtime::PlanningCandidateId admission,
+    std::span<const runtime::PlanningOwnerId> preferred_owner_ids) {
+    if (scratch_live) { throw std::logic_error("pressure expansion scratch is still live"); }
+    const std::uint32_t selected_candidate = candidate_index(admission);
+    populate_options(selected_candidate);
+    CandidateOptions& options       = candidate_options[selected_candidate];
+    const CandidateState& candidate = *candidates[selected_candidate].state;
+    const std::optional<typename Core::MaterializationSourceProtection> protection =
+        program->materialization_source_protection(candidate);
+    if (!protection) { return std::nullopt; }
+
+    // Victims ranked least-valuable first: preferred_owner_ids is already sorted by
+    // ascending value (selected_hit_count, shared credit, retention weight, recency);
+    // unranked victims trail in owner order. The ranking drives which victims are
+    // dropped when both tiers are full; demotion preserves every victim regardless.
+    std::vector<std::size_t> victim_order;
+    victim_order.reserve(options.victims.size());
+    const auto append_victim = [&](std::size_t victim_index) {
+        if (std::find(victim_order.begin(), victim_order.end(), victim_index) ==
+            victim_order.end()) {
+            victim_order.push_back(victim_index);
+        }
+    };
+    for (const runtime::PlanningOwnerId id : preferred_owner_ids) {
+        const auto found =
+            std::find_if(options.victims.begin(), options.victims.end(), [&](const auto& victim) {
+                return victim.owner_index < owners.size() && owners[victim.owner_index].id == id;
+            });
+        if (found != options.victims.end()) {
+            append_victim(static_cast<std::size_t>(found - options.victims.begin()));
+        }
+    }
+    for (std::size_t index = 0; index < options.victims.size(); ++index) { append_victim(index); }
+
+    const auto projected_residual = [&](std::span<const std::uint16_t> target_choices,
+                                        std::optional<std::size_t> override_owner,
+                                        const PressureDecision* override_decision) {
+        detail::PhysicalDelta pressure;
+        std::vector<std::uint32_t> demote_main;
+        std::vector<std::uint32_t> demote_back;
+        std::uint64_t host_freed_by_evictions = 0;
+        for (std::size_t index = 0; index < options.victims.size(); ++index) {
+            const PressureDecision* decision = nullptr;
+            if (override_owner && *override_owner == index) {
+                decision = override_decision;
+            } else {
+                const std::uint16_t choice = target_choices[index];
+                if (choice != 0) {
+                    if (choice > options.victims[index].decisions.size()) {
+                        throw std::logic_error("deterministic pressure choice is invalid");
+                    }
+                    decision = &options.victims[index].decisions[choice - 1U];
+                }
+            }
+            if (decision == nullptr) { continue; }
+            pressure.added = NINFER_QWEN36_RUNTIME_NS::planning_resource_sum(
+                pressure.added, decision->effect.added);
+            pressure.removed = NINFER_QWEN36_RUNTIME_NS::planning_resource_sum(
+                pressure.removed, decision->effect.removed);
+            if (decision->evicts_continuation) {
+                host_freed_by_evictions += decision->effect.removed.host.kv_bytes;
+            }
+            for (const PressureKVDecision& kv : decision->main_kv_changes) {
+                if (kv.kind == PressureKVDecisionKind::DemoteToHost && kv.page_count != 0) {
+                    demote_main.push_back(kv.page_count);
+                }
+            }
+            for (const PressureKVDecision& kv : decision->backend_kv_changes) {
+                if (kv.kind == PressureKVDecisionKind::DemoteToHost && kv.page_count != 0) {
+                    demote_back.push_back(kv.page_count);
+                }
+            }
+        }
+        detail::PhysicalResources residual =
+            program->guided_materialization_deficit(candidate, pressure);
+        // The plan's demotes add Host KV that compose_pressure_candidate must actually
+        // allocate in the Host extent arena, whose free space can be fragmented (the
+        // byte-total model above is optimistic). Ask the allocator: if the demote
+        // requests fit the current free extents, the byte model stands; otherwise the
+        // unpaid Host addition (demoted minus freed-by-DropHostDuplicate) becomes Host
+        // pressure so Phase 2 pays it by dropping Host duplicates of low-value shared
+        // prefixes — demote without eviction, reprocessing nothing.
+        const std::uint64_t added_host_kv = pressure.added.host.kv_bytes;
+        const std::uint64_t freed_host_kv = pressure.removed.host.kv_bytes;
+        // The admission's blocked bytes are all-or-nothing (the arena cannot serve the
+        // whole demote set as-is), but the tier still has free space. Charge only the
+        // true shortfall: requested minus the currently free Host bytes minus anything
+        // this plan already frees. Otherwise Phase 2 would over-evict (targeting the
+        // full demote instead of the few stale contexts that actually cover the gap).
+        const detail::PhysicalResources host_occupancy = program->physical_occupancy();
+        const std::uint64_t host_capacity_bytes =
+            program->admission_capacity().host.kv_bytes;
+        const std::uint64_t host_free_bytes =
+            host_capacity_bytes > host_occupancy.host.kv_bytes
+                ? host_capacity_bytes - host_occupancy.host.kv_bytes
+                : 0;
+        const std::uint64_t host_shortfall =
+            added_host_kv > freed_host_kv + host_free_bytes
+                ? added_host_kv - freed_host_kv - host_free_bytes
+                : 0;
+        // The byte model above over-credits Host frees the hot tier never lets go
+        // of (host copies are kept, so compose's real allocator can reject a demote
+        // set the model considers free — run 44: 2.79 GiB requested vs 2.48 GiB free,
+        // residual host=0). Ask the allocator directly: if the plan's demotes don't
+        // fit the current free extents, surface the true Host demand as pressure so
+        // Phase 3 converts demotes to evictions (zero Host demand) instead of
+        // compose failing the whole plan and falling back to a root re-prefill.
+        bool host_fits = true;
+        if (added_host_kv != 0) {
+            // The conservative allocator answer (no releases) is safe but blind to the
+            // Host this plan itself frees by eviction — and eviction frees ARE
+            // deterministic (the victim's Host extents are destroyed), unlike
+            // DropHostDuplicate which the hot tier may never materialize (run 44:
+            // rel=0/330). At high Host occupancy that blind spot wrongly blocks the
+            // eviction-based plan and the planner falls back to a partial reuse.
+            // Accept when the real allocator fits OR the plan's own evictions free
+            // enough Host to cover the demote demand.
+            const bool allocator_fits = program->host_kv_requests_fit(demote_main, demote_back);
+            const bool eviction_frees_cover =
+                added_host_kv <= host_free_bytes + host_freed_by_evictions;
+            host_fits = allocator_fits || eviction_frees_cover;
+        }
+        if (host_fits) {
+            residual.host.kv_bytes = std::max(residual.host.kv_bytes, host_shortfall);
+        } else {
+            residual.host.kv_bytes = std::max(residual.host.kv_bytes, added_host_kv);
+        }
+        return residual;
+    };
+    const detail::PhysicalResources capacity = program->admission_capacity();
+    constexpr std::uint64_t kResidualOne     = 1ULL << 20U;
+    const auto normalized                    = [](std::uint64_t value, std::uint64_t limit) {
+        if (value == 0) { return std::uint64_t{0}; }
+        if (limit == 0 || value >= limit) { return kResidualOne; }
+        if (value > std::numeric_limits<std::uint64_t>::max() / kResidualOne) {
+            return kResidualOne;
+        }
+        const std::uint64_t scaled = value * kResidualOne;
+        return std::max<std::uint64_t>(1, scaled / limit + (scaled % limit != 0 ? 1U : 0U));
+    };
+    const auto residual_key = [&](const detail::PhysicalResources& residual) {
+        std::uint32_t constraints = 0;
+        std::uint64_t total       = 0;
+        const auto append         = [&](std::uint64_t value, std::uint64_t limit) {
+            if (value == 0) { return; }
+            ++constraints;
+            NINFER_QWEN36_RUNTIME_NS::planning_saturating_add(total, normalized(value, limit));
+        };
+        append(residual.device.active_lanes, capacity.device.active_lanes);
+        append(residual.device.state_slots, capacity.device.state_slots);
+        append(residual.device.main_kv_pages, capacity.device.main_kv_pages);
+        append(residual.device.backend_kv_pages, capacity.device.backend_kv_pages);
+        append(residual.host.state_slots, capacity.host.state_slots);
+        append(residual.host.kv_bytes, capacity.host.kv_bytes);
+        return std::tuple{constraints, total};
+    };
+    const auto feasible = [&](const detail::PhysicalResources& residual) {
+        return residual == detail::PhysicalResources{};
+    };
+    // Device and Host over-commitment keys drive the two-stage waterfall: demotes may
+    // defer Host over-commitment (paid off by state drops) instead of being blocked by
+    // a momentarily full Host tier.
+    const auto device_key = [&](const detail::PhysicalResources& residual) {
+        std::uint64_t total = 0;
+        const auto append   = [&](std::uint64_t value, std::uint64_t limit) {
+            if (value == 0) { return; }
+            NINFER_QWEN36_RUNTIME_NS::planning_saturating_add(total, normalized(value, limit));
+        };
+        append(residual.device.active_lanes, capacity.device.active_lanes);
+        append(residual.device.state_slots, capacity.device.state_slots);
+        append(residual.device.main_kv_pages, capacity.device.main_kv_pages);
+        append(residual.device.backend_kv_pages, capacity.device.backend_kv_pages);
+        return total;
+    };
+
+    struct Selection {
+        std::size_t victim_index = 0;
+        PressureDecision decision;
+        detail::PhysicalResources residual;
+    };
+    const auto intern_selection = [&](const Selection& selection) {
+        std::vector<PressureDecision>& decisions =
+            options.victims[selection.victim_index].decisions;
+        const auto existing =
+            std::find(decisions.begin(), decisions.end(), selection.decision);
+        if (existing != decisions.end()) {
+            return static_cast<std::uint16_t>(1U + (existing - decisions.begin()));
+        }
+        if (decisions.size() >= std::numeric_limits<std::uint16_t>::max()) {
+            throw std::length_error("pressure owner target count is not representable");
+        }
+        decisions.push_back(selection.decision);
+        return static_cast<std::uint16_t>(decisions.size());
+    };
+    const auto refresh_options = [&](CandidateVictimOptions& victim,
+                                     const detail::PhysicalResources& residual,
+                                     const PressureDecision* current) {
+        std::vector<PressureDecision> successors =
+            pressure_successors(victim, residual, *protection, current);
+        for (PressureDecision& successor : successors) {
+            if (std::find(victim.decisions.begin(), victim.decisions.end(), successor) ==
+                victim.decisions.end()) {
+                if (victim.decisions.size() >= std::numeric_limits<std::uint16_t>::max()) {
+                    throw std::length_error("pressure owner target count is not representable");
+                }
+                victim.decisions.push_back(std::move(successor));
+            }
+        }
+    };
+
+    choice_scratch.assign(options.victims.size(), 0);
+    const std::size_t maximum_steps =
+        32U * std::max<std::size_t>(1, options.victims.size()) + 32U;
+    using PlanningContractAccess =
+        qwen3_6::detail::RuntimeContractAccess<NINFER_QWEN36_VARIANT>;
+    const auto owner_kv = [&](std::size_t victim_index)
+        -> std::pair<std::optional<KVAddressSpaceHandle>,
+                     std::optional<KVAddressSpaceHandle>> {
+        const Owner& owner = owners[options.victims[victim_index].owner_index];
+        if (owner.shared) {
+            const auto& s =
+                program->shared_prefix_states[PlanningContractAccess::index(*owner.shared_handle)];
+            if (!s.kv) { return {}; }
+            return {s.kv->text, s.kv->backend};
+        }
+        const auto& c =
+            program->continuation_states[PlanningContractAccess::index(*owner.private_handle)];
+        if (!c.kv) { return {}; }
+        return {c.kv->text, c.kv->backend};
+    };
+    // Page-disjointness guard: demote decisions must never target the same
+    // physical KV page twice within one plan. Nested same-session shared
+    // prefixes (and the shared system prefix) overlap, and the exact
+    // materialization check rejects duplicated page targets — which would
+    // otherwise collapse the whole deterministic plan and fall back to root.
+    std::vector<std::vector<std::uint32_t>> victim_pages(options.victims.size());
+    const auto collect_pages = [&](std::size_t victim_index,
+                                   const PressureDecision& decision,
+                                   std::vector<std::uint32_t>& text_targets,
+                                   std::vector<std::uint32_t>& back_targets) -> bool {
+        const auto [text_address, back_address] = owner_kv(victim_index);
+        const auto collect = [&](const auto& addresses, const auto& pages,
+                                 std::optional<KVAddressSpaceHandle> address,
+                                 const std::vector<PressureKVDecision>& changes,
+                                 std::vector<std::uint32_t>& out) -> bool {
+            if (changes.empty()) { return true; }
+            if (!address || !addresses || !pages) { return false; }
+            const std::uint32_t mapped = addresses->mapped_pages(*address);
+            for (const PressureKVDecision& action : changes) {
+                if (action.kind == PressureKVDecisionKind::None) { continue; }
+                if (action.begin_page > mapped ||
+                    action.page_count > mapped - action.begin_page) {
+                    return false;
+                }
+                for (std::uint32_t offset = 0; offset < action.page_count; ++offset) {
+                    out.push_back(pages->descriptor_index(
+                        addresses->logical_page(*address, action.begin_page + offset)));
+                }
+            }
+            return true;
+        };
+        return collect(program->text_kv_addresses, program->text_kv_pages, text_address,
+                       decision.main_kv_changes, text_targets) &&
+               collect(program->backend_kv_addresses, program->backend_kv_pages, back_address,
+                       decision.backend_kv_changes, back_targets);
+    };
+    const auto overlaps_committed = [&](std::size_t victim_index,
+                                        const PressureDecision& decision) -> bool {
+        std::vector<std::uint32_t> text_targets;
+        std::vector<std::uint32_t> back_targets;
+        if (!collect_pages(victim_index, decision, text_targets, back_targets)) { return true; }
+        const auto overlaps = [&](const std::vector<std::uint32_t>& candidate,
+                                  const std::vector<std::uint32_t>& committed) {
+            for (const std::uint32_t page : candidate) {
+                if (std::find(committed.begin(), committed.end(), page) != committed.end()) {
+                    return true;
+                }
+            }
+            return false;
+        };
+        for (std::size_t other = 0; other < options.victims.size(); ++other) {
+            if (other == victim_index) { continue; }
+            const bool text_overlap  = overlaps(text_targets, victim_pages[other]);
+            const bool back_overlap  = overlaps(back_targets, victim_pages[other]);
+            if (text_overlap || back_overlap) {
+                return true;
+            }
+        }
+        return false;
+    };
+    const auto commit_pages = [&](std::size_t victim_index, const PressureDecision& decision) {
+        std::vector<std::uint32_t> text_targets;
+        std::vector<std::uint32_t> back_targets;
+        if (!collect_pages(victim_index, decision, text_targets, back_targets)) {
+            throw std::logic_error("deterministic page guard cannot resolve target pages");
+        }
+        std::vector<std::uint32_t>& own = victim_pages[victim_index];
+        own.clear();
+        for (const std::uint32_t page : text_targets) {
+            if (std::find(own.begin(), own.end(), page) == own.end()) { own.push_back(page); }
+        }
+        for (const std::uint32_t page : back_targets) {
+            if (std::find(own.begin(), own.end(), page) == own.end()) { own.push_back(page); }
+        }
+    };
+
+
+    // Trim a demote/device-drop decision to its exclusive pages: drop pages already
+    // committed by other victims (shared prefixes / nested contexts). A whole-tree
+    // demote (main + shared prefix) would otherwise be rejected by the page guard
+    // and the victim would fall through to eviction — the exact bug that made the
+    // planner mass-evict mains at the ~130K working-set point.
+    const auto trim_to_exclusive = [&](std::size_t victim_index,
+                                       const PressureDecision& decision)
+        -> std::optional<PressureDecision> {
+        std::vector<std::uint32_t> committed;
+        for (std::size_t other = 0; other < options.victims.size(); ++other) {
+            if (other == victim_index) { continue; }
+            committed.insert(committed.end(), victim_pages[other].begin(),
+                             victim_pages[other].end());
+        }
+        std::sort(committed.begin(), committed.end());
+        committed.erase(std::unique(committed.begin(), committed.end()), committed.end());
+
+        const auto [text_addr, back_addr] = owner_kv(victim_index);
+
+        PressureDecision out = decision;
+        out.main_kv_changes.clear();
+        out.backend_kv_changes.clear();
+        out.transfer_requirements.clear();
+        out.effect = detail::PhysicalDelta{};
+        // State/checkpoint contributions are untouched by the trim.
+        out.effect.removed.device.state_slots = decision.effect.removed.device.state_slots;
+        out.effect.added.host.state_slots     = decision.effect.added.host.state_slots;
+        out.effect.removed.host.state_slots   = decision.effect.removed.host.state_slots;
+        out.effect.added.device.state_slots   = decision.effect.added.device.state_slots;
+        out.checkpoint_drop_effect            = decision.checkpoint_drop_effect;
+
+        const auto trim_store = [&](const auto& addresses, const auto& pages,
+                                    std::optional<KVAddressSpaceHandle> address,
+                                    const std::vector<PressureKVDecision>& changes,
+                                    std::vector<PressureKVDecision>& out_changes,
+                                    runtime::ContextResourceClass resource) {
+            if (!address || !addresses || !pages) { return; }
+            const HostKVPageLayout layout =
+                plan_host_kv_page_layout(pages->physical_pool().geometry());
+            const std::uint32_t mapped = addresses->mapped_pages(*address);
+            const bool backend =
+                resource == runtime::ContextResourceClass::BackendKV;
+            const auto emit = [&](PressureKVDecision action) {
+                const std::uint64_t bytes =
+                    layout.page_stride * static_cast<std::uint64_t>(action.page_count);
+                if (action.kind == PressureKVDecisionKind::DemoteToHost) {
+                    if (backend) {
+                        out.effect.removed.device.backend_kv_pages += action.page_count;
+                    } else {
+                        out.effect.removed.device.main_kv_pages += action.page_count;
+                    }
+                    out.effect.added.host.kv_bytes += bytes;
+                    std::vector<DeviceKVPageHandle> physical;
+                    physical.reserve(action.page_count);
+                    for (std::uint32_t off = 0; off < action.page_count; ++off) {
+                        physical.push_back(pages->physical(
+                            addresses->logical_page(*address, action.begin_page + off)));
+                    }
+                    const std::uint32_t runs =
+                        pages->physical_pool().contiguous_run_count(physical);
+                    const TransferWork work =
+                        plan_host_kv_transfer_work(layout, action.page_count, runs);
+                    out.transfer_requirements.push_back(runtime::ContextTransferRequirement{
+                        .resource   = resource,
+                        .direction  = runtime::ContextTransferDirection::DeviceToHost,
+                        .units      = work.payload_bytes,
+                        .page_count = action.page_count,
+                        .work       = work,
+                    });
+                } else if (action.kind ==
+                           PressureKVDecisionKind::DropDeviceDuplicate) {
+                    if (backend) {
+                        out.effect.removed.device.backend_kv_pages += action.page_count;
+                    } else {
+                        out.effect.removed.device.main_kv_pages += action.page_count;
+                    }
+                } else if (action.kind == PressureKVDecisionKind::DropHostDuplicate) {
+                    out.effect.removed.host.kv_bytes += bytes;
+                }
+                out_changes.push_back(action);
+            };
+            for (const PressureKVDecision& action : changes) {
+                if (action.kind == PressureKVDecisionKind::None || action.page_count == 0) {
+                    continue;
+                }
+                std::uint32_t run_begin = action.begin_page;
+                const std::uint32_t end = action.begin_page + action.page_count;
+                for (std::uint32_t p = action.begin_page; p < end; ++p) {
+                    const LogicalKVPageHandle logical =
+                        addresses->logical_page(*address, p);
+                    const bool taken = std::binary_search(
+                        committed.begin(), committed.end(), pages->descriptor_index(logical));
+                    if (taken) {
+                        if (p > run_begin) {
+                            emit({.begin_page = run_begin, .page_count = p - run_begin,
+                                  .kind = action.kind});
+                        }
+                        run_begin = p + 1;
+                    }
+                }
+                if (end > run_begin) {
+                    emit({.begin_page = run_begin, .page_count = end - run_begin,
+                          .kind = action.kind});
+                }
+            }
+        };
+        trim_store(program->text_kv_addresses, program->text_kv_pages, text_addr,
+                   decision.main_kv_changes, out.main_kv_changes,
+                   runtime::ContextResourceClass::MainKV);
+        trim_store(program->backend_kv_addresses, program->backend_kv_pages, back_addr,
+                   decision.backend_kv_changes, out.backend_kv_changes,
+                   runtime::ContextResourceClass::BackendKV);
+        if (out.main_kv_changes.empty() && out.backend_kv_changes.empty() &&
+            out.state_changes.empty() && out.dropped_checkpoints.empty()) {
+            return std::nullopt;
+        }
+        return out;
+    };
+
+    // Phase 1 — device waterfall: while the device is over-committed, demote the
+    // lowest-value victims whose retained (non-evicting, no-new-checkpoint-drop)
+    // decision strictly reduces device over-commitment. Host impact is deferred to
+    // phase 2, so several demotes can chain even when the Host tier is momentarily full.
+    for (std::size_t step = 0; step < maximum_steps; ++step) {
+        const detail::PhysicalResources residual =
+            projected_residual(choice_scratch, std::nullopt, nullptr);
+        if (device_key(residual) == 0) { break; }
+        std::optional<Selection> selected;
+        for (const std::size_t victim_index : victim_order) {
+            CandidateVictimOptions& victim = options.victims[victim_index];
+            const std::uint16_t current_choice = choice_scratch[victim_index];
+            const PressureDecision* current =
+                current_choice == 0 ? nullptr : &victim.decisions[current_choice - 1U];
+            if (current != nullptr && current->evicts_continuation) { continue; }
+            refresh_options(victim, residual, current);
+            for (std::uint16_t choice = 1; choice <= victim.decisions.size(); ++choice) {
+                const PressureDecision& candidate = victim.decisions[choice - 1U];
+                if (candidate.evicts_continuation) { continue; }
+                const std::uint32_t prior_drops =
+                    current == nullptr ? 0 : current->checkpoint_drops;
+                if (candidate.checkpoint_drops > prior_drops) { continue; }
+                const PressureDecision* effective = &candidate;
+                PressureDecision trimmed;
+                if (overlaps_committed(victim_index, candidate)) {
+                    std::optional<PressureDecision> t =
+                        trim_to_exclusive(victim_index, candidate);
+                    if (!t || (t->main_kv_changes.empty() && t->backend_kv_changes.empty() &&
+                               t->state_changes.empty())) {
+                        continue;
+                    }
+                    trimmed = std::move(*t);
+                    effective = &trimmed;
+                }
+                const detail::PhysicalResources child =
+                    projected_residual(choice_scratch, victim_index, effective);
+                if (device_key(child) >= device_key(residual)) { continue; }
+                selected = Selection{
+                    .victim_index = victim_index,
+                    .decision     = *effective,
+                    .residual     = child,
+                };
+                break;
+            }
+            if (selected) { break; }
+        }
+        if (!selected) { break; }
+        choice_scratch[selected->victim_index] = intern_selection(*selected);
+        commit_pages(selected->victim_index, selected->decision);
+    }
+
+    // Phase 2 — Host payoff: while Host (or the whole plan) is still over-committed,
+    // drop the state checkpoints of the lowest-value victims whose retained decision
+    // adds checkpoint drops and strictly reduces the total over-commitment. This pays
+    // the Host debt deferred by phase 1 (and any Host pressure the admission itself
+    // brings) without evicting any context — KV stays cached, prefixes stay reusable.
+    for (std::size_t step = 0; step < maximum_steps; ++step) {
+        const detail::PhysicalResources residual =
+            projected_residual(choice_scratch, std::nullopt, nullptr);
+        if (feasible(residual)) { break; }
+        std::optional<Selection> selected;
+        for (const std::size_t victim_index : victim_order) {
+            CandidateVictimOptions& victim = options.victims[victim_index];
+            const std::uint16_t current_choice = choice_scratch[victim_index];
+            const PressureDecision* current =
+                current_choice == 0 ? nullptr : &victim.decisions[current_choice - 1U];
+            if (current != nullptr && current->evicts_continuation) { continue; }
+            refresh_options(victim, residual, current);
+            for (std::uint16_t choice = 1; choice <= victim.decisions.size(); ++choice) {
+                const PressureDecision& candidate = victim.decisions[choice - 1U];
+                const std::uint32_t prior_drops =
+                    current == nullptr ? 0 : current->checkpoint_drops;
+                if (candidate.evicts_continuation) {
+                    // Host-relief eviction: relieve a full Host tier (and the device
+                    // over-commitment) by evicting the lowest-value victim whose eviction
+                    // frees Host bytes. Private victims only — the shared system prefix
+                    // and live mains' shared base must survive (their pages are not
+                    // exclusive to this owner anyway). Never undo a phase 1 demote.
+                    if (candidate.effect.removed.host.kv_bytes == 0) { continue; }
+                    if (current != nullptr && !current->evicts_continuation) { continue; }
+                    if (owners[options.victims[victim_index].owner_index].shared) { continue; }
+                } else {
+                    const bool adds_drops    = candidate.checkpoint_drops > prior_drops;
+                    const bool frees_host_kv = candidate.effect.removed.host.kv_bytes != 0;
+                    if (!adds_drops && !frees_host_kv) { continue; }
+                    if (overlaps_committed(victim_index, candidate)) { continue; }
+                }
+                const detail::PhysicalResources child =
+                    projected_residual(choice_scratch, victim_index, &candidate);
+                if (!(residual_key(child) < residual_key(residual))) { continue; }
+                selected = Selection{
+                    .victim_index = victim_index,
+                    .decision     = candidate,
+                    .residual     = child,
+                };
+                break;
+            }
+            if (selected) { break; }
+        }
+        if (!selected) { break; }
+        choice_scratch[selected->victim_index] = intern_selection(*selected);
+        commit_pages(selected->victim_index, selected->decision);
+    }
+
+    // Phase 3 — evict: last resort. While still infeasible, evict the lowest-value
+    // victims (in value order) whose eviction strictly reduces the total over-commitment.
+    // Both tiers are full and everything retainable has been retained at this point.
+    for (std::size_t step = 0; step < maximum_steps; ++step) {
+        const detail::PhysicalResources residual =
+            projected_residual(choice_scratch, std::nullopt, nullptr);
+        if (feasible(residual)) { break; }
+        std::optional<Selection> selected;
+        for (const std::size_t victim_index : victim_order) {
+            const CandidateVictimOptions& victim = options.victims[victim_index];
+            if (victim.eviction_choice == 0 || victim.eviction_choice > victim.decisions.size()) {
+                continue;
+            }
+            if (choice_scratch[victim_index] == victim.eviction_choice) { continue; }
+            const PressureDecision& eviction = victim.decisions[victim.eviction_choice - 1U];
+            const detail::PhysicalResources child =
+                projected_residual(choice_scratch, victim_index, &eviction);
+            if (!(residual_key(child) < residual_key(residual))) { continue; }
+            selected = Selection{
+                .victim_index = victim_index,
+                .decision     = eviction,
+                .residual     = child,
+            };
+            break;
+        }
+        if (!selected) { break; }
+        choice_scratch[selected->victim_index] =
+            options.victims[selected->victim_index].eviction_choice;
+    }
+
+    TargetNode* existing = find_target(selected_candidate, choice_scratch);
+    const std::size_t maximum =
+        candidates.size() + 1U + planning_detail::kOptionalTargetCapacity;
+    if (existing == nullptr && targets.size() >= maximum) { return std::nullopt; }
+    const std::uint32_t target_index =
+        existing != nullptr ? static_cast<std::uint32_t>(existing - targets.data())
+                            : intern_target(selected_candidate, choice_scratch);
+    qwen3_6::PressureTargetHandle handle;
+    handle.session_    = this;
+    handle.generation_ = generation;
+    handle.index_      = target_index;
+    return handle;
 }
 
 inline runtime::PressureTargetGuidance
