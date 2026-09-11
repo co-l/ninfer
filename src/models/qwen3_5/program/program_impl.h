@@ -1011,6 +1011,8 @@ private:
     [[nodiscard]] detail::PhysicalResources
     guided_materialization_deficit(const ResourceCandidateState& candidate,
                                    const detail::PhysicalDelta& pressure) const;
+    [[nodiscard]] bool host_kv_requests_fit(std::span<const std::uint32_t> main_pages,
+                                            std::span<const std::uint32_t> back_pages) const;
     [[nodiscard]] bool
     protected_materialization_page(const MaterializationSourceProtection* protection,
                                    const KVAddressSpaceStore& addresses, std::uint32_t page_offset,
@@ -1302,6 +1304,15 @@ struct PressurePlanningSessionImpl {
     [[nodiscard]] detail::PhysicalResources
     construction_residual(std::uint32_t candidate_index,
                           std::span<const std::uint16_t> choices) const;
+    [[nodiscard]] std::optional<qwen3_5::PressureTargetHandle>
+    guided_closure_target(runtime::PlanningCandidateId candidate,
+                          std::span<const runtime::PlanningOwnerId> preferred_owner_ids);
+    [[nodiscard]] std::optional<qwen3_5::PressureTargetHandle>
+    graceful_fallback_target(runtime::PlanningCandidateId candidate,
+                             std::span<const runtime::PlanningOwnerId> preferred_owner_ids);
+    [[nodiscard]] std::optional<qwen3_5::PressureTargetHandle>
+    deterministic_target(runtime::PlanningCandidateId candidate,
+                         std::span<const runtime::PlanningOwnerId> preferred_owner_ids);
     [[nodiscard]] runtime::PressureTargetGuidance guidance(qwen3_5::PressureTargetHandle target);
     [[nodiscard]] qwen3_5::AssessedPressureTarget assess(qwen3_5::PressureTargetHandle target);
     [[nodiscard]] qwen3_5::PreparedPressureExpansion

@@ -491,6 +491,31 @@ ProgramImpl::guided_materialization_deficit(const ResourceCandidateState& admiss
     return positive_resource_difference(required, admission_capacity());
 }
 
+bool
+ProgramImpl::host_kv_requests_fit(std::span<const std::uint32_t> main_pages,
+                                  std::span<const std::uint32_t> back_pages) const {
+    std::vector<HostKVAllocationRequest> requests;
+    requests.reserve(main_pages.size() + back_pages.size());
+    std::vector<HostKVPageLayout> layouts;
+    layouts.reserve(2);
+    if (text_kv_pages) {
+        layouts.push_back(plan_host_kv_page_layout(text_kv_pages->physical_pool().geometry()));
+        for (const std::uint32_t pages : main_pages) {
+            if (pages != 0) { requests.push_back({.layout = &layouts.back(), .pages = pages}); }
+        }
+    }
+    if (backend_kv_pages) {
+        layouts.push_back(plan_host_kv_page_layout(backend_kv_pages->physical_pool().geometry()));
+        for (const std::uint32_t pages : back_pages) {
+            if (pages != 0) { requests.push_back({.layout = &layouts.back(), .pages = pages}); }
+        }
+    }
+    if (requests.empty()) { return true; }
+    if (host_kv_extents == nullptr) { return false; }
+    const std::span<const HostKVPageReplicaRelease> no_releases;
+    return host_kv_extents->can_allocate_after_page_releases(no_releases, requests);
+}
+
 bool ProgramImpl::physical_peak_fits(detail::PhysicalResources peak) const noexcept {
     const detail::PhysicalResources occupied = physical_occupancy();
     const detail::PhysicalResources limits   = admission_capacity();

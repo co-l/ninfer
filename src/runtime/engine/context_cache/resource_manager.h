@@ -8,6 +8,7 @@
 #include "runtime/engine/context_cache/shared_capture_planner.h"
 
 #include <algorithm>
+#include <cstdio>
 #include <array>
 #include <bit>
 #include <chrono>
@@ -321,10 +322,14 @@ public:
 
         if (cache_enabled_) {
             for (const PrefixIndexEntry& index : prefix_index_) {
-                if (!valid_prefix_index_entry(index)) { continue; }
+                if (!valid_prefix_index_entry(index)) {
+                    continue;
+                }
                 const std::optional<PrefixShortlistKey> incoming =
                     base.prefix_shortlist_key(index.key.frontier);
-                if (!incoming || *incoming != index.key) { continue; }
+                if (!incoming || *incoming != index.key) {
+                    continue;
+                }
 
                 if (!index.shared) {
                     const CatalogEntry& entry = catalog_[index.slot];
@@ -339,7 +344,9 @@ public:
                     std::optional<AdmissionCandidate> plan =
                         program.inspect_admission(prompt, base, *destination, &*entry.handle,
                                                   nullptr, index.checkpoint, retain);
-                    if (!plan) { continue; }
+                    if (!plan) {
+                        continue;
+                    }
                     if (plan->summary().reusable_prompt_tokens == 0 ||
                         (retain &&
                          plan->identity_assessment().source_mode != PrivateSourceMode::Retain)) {

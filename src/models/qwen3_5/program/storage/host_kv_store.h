@@ -6,6 +6,7 @@
 #include <algorithm>
 #include <cstddef>
 #include <cstdint>
+#include <cstdio>
 #include <exception>
 #include <limits>
 #include <optional>
@@ -91,16 +92,28 @@ public:
     [[nodiscard]] std::optional<HostKVExtentReservation>
     prepare(LogicalKVPageStore& pages, std::span<const LogicalKVPageHandle> membership) {
         if (membership.empty() || free_count_ == 0 || membership.size() > free_membership_count_) {
+            std::fprintf(stderr,
+                         "[host] extent prepare FAIL count=%zu free=%zu mfree=%zu pages=%zu\n",
+                         occupied(), free_count_, free_membership_count_, membership.size());
             return std::nullopt;
         }
         for (const LogicalKVPageHandle page : membership) {
-            if (!pages.can_pin_source(page) || pages.host_resident(page)) { return std::nullopt; }
+            if (!pages.can_pin_source(page) || pages.host_resident(page)) {
+                std::fprintf(stderr, "[host] extent prepare FAIL pin/host-resident\n");
+                return std::nullopt;
+            }
         }
 
         const HostKVPageLayout& layout = page_layout(pages);
         std::optional<HostKVAllocation> allocation =
             arena_->allocate(layout, static_cast<std::uint32_t>(membership.size()));
-        if (!allocation) { return std::nullopt; }
+        if (!allocation) {
+            std::fprintf(stderr,
+                         "[host] arena allocate FAIL pages=%zu occupied=%zu cap=%zu\n",
+                         membership.size(), arena_->occupied_bytes(),
+                         arena_->capacity_bytes());
+            return std::nullopt;
+        }
 
         const std::uint32_t descriptor = free_[--free_count_];
         Extent& extent                 = extents_[descriptor];
@@ -337,13 +350,15 @@ public:
             });
             return true;
         };
-        for (const HostKVPageReplicaRelease& release : releases) {
+        for (std::size_t idx = 0; idx < releases.size(); ++idx) {
+            const HostKVPageReplicaRelease& release = releases[idx];
             if (release.pages == nullptr || !mark_release(*release.pages, release.page, false) ||
                 !append(release)) {
                 return false;
             }
         }
-        for (const HostKVPageReplicaRelease& release : last_reference_releases) {
+        for (std::size_t idx = 0; idx < last_reference_releases.size(); ++idx) {
+            const HostKVPageReplicaRelease& release = last_reference_releases[idx];
             if (release.pages == nullptr || !mark_release(*release.pages, release.page, true) ||
                 !append(release)) {
                 return false;

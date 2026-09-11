@@ -155,6 +155,22 @@ PressurePlanningSession::construction_target(const PressureConstructionCursor& c
     return impl_->construction_target(cursor);
 }
 
+std::optional<PressureTargetHandle>
+PressurePlanningSession::graceful_fallback_target(
+    runtime::PlanningCandidateId candidate,
+    std::span<const runtime::PlanningOwnerId> preferred_owner_ids) {
+    if (impl_ == nullptr) { throw std::logic_error("pressure planning session is empty"); }
+    return impl_->graceful_fallback_target(candidate, preferred_owner_ids);
+}
+
+std::optional<PressureTargetHandle>
+PressurePlanningSession::deterministic_target(
+    runtime::PlanningCandidateId candidate,
+    std::span<const runtime::PlanningOwnerId> preferred_owner_ids) {
+    if (impl_ == nullptr) { throw std::logic_error("pressure planning session is empty"); }
+    return impl_->deterministic_target(candidate, preferred_owner_ids);
+}
+
 runtime::PressureTargetGuidance PressurePlanningSession::guidance(PressureTargetHandle target) {
     if (impl_ == nullptr) { throw std::logic_error("pressure planning session is empty"); }
     return impl_->guidance(target);
