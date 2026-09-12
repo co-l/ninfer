@@ -1030,7 +1030,9 @@ PressurePlanningSessionImpl<NINFER_QWEN36_VARIANT>::deterministic_target(
         // fit the current free extents, surface the true Host demand as pressure so
         // Phase 3 converts demotes to evictions (zero Host demand) instead of
         // compose failing the whole plan and falling back to a root re-prefill.
-        bool host_fits = true;
+        bool host_fits            = true;
+        bool allocator_fits       = false;
+        bool eviction_frees_cover = false;
         if (added_host_kv != 0) {
             // The conservative allocator answer (no releases) is safe but blind to the
             // Host this plan itself frees by eviction — and eviction frees ARE
@@ -1040,15 +1042,26 @@ PressurePlanningSessionImpl<NINFER_QWEN36_VARIANT>::deterministic_target(
             // eviction-based plan and the planner falls back to a partial reuse.
             // Accept when the real allocator fits OR the plan's own evictions free
             // enough Host to cover the demote demand.
-            const bool allocator_fits = program->host_kv_requests_fit(demote_main, demote_back);
-            const bool eviction_frees_cover =
+            allocator_fits = program->host_kv_requests_fit(demote_main, demote_back);
+            eviction_frees_cover =
                 added_host_kv <= host_free_bytes + host_freed_by_evictions;
             host_fits = allocator_fits || eviction_frees_cover;
         }
+        // Host pressure when the plan does not fit is the deterministic shortfall: the
+        // demote demand minus what the plan's own evictions already free minus the tier's
+        // free space. Charging the full demand here (all-or-nothing) hid partial relief —
+        // chained small evictions could never accumulate in the residual key, so the
+        // planner jumped straight to a single big victim (a live main) instead of chaining
+        // dead-weight evictions. Only eviction frees are credited (deterministic);
+        // DropHostDuplicate may never materialize (rel=0/330).
+        const std::uint64_t host_det_shortfall =
+            added_host_kv > host_freed_by_evictions + host_free_bytes
+                ? added_host_kv - host_freed_by_evictions - host_free_bytes
+                : 0;
         if (host_fits) {
             residual.host.kv_bytes = std::max(residual.host.kv_bytes, host_shortfall);
         } else {
-            residual.host.kv_bytes = std::max(residual.host.kv_bytes, added_host_kv);
+            residual.host.kv_bytes = std::max(residual.host.kv_bytes, host_det_shortfall);
         }
         return residual;
     };
@@ -1349,6 +1362,27 @@ PressurePlanningSessionImpl<NINFER_QWEN36_VARIANT>::deterministic_target(
         return out;
     };
 
+    // Eviction order: smallest victims first (least destructive), stable within the value
+    // ranking. The hit-count model is degenerate for this workload (no selections observed,
+    // so value order reduces to ID order and evicts the largest live mains first). Preferring
+    // smaller victims protects the big long-lived contexts and chains the dead small ones.
+    const auto victim_size = [&](std::size_t victim_index) -> std::uint64_t {
+        const auto kv = owner_kv(victim_index);
+        std::uint64_t pages = 0;
+        if (kv.first && program->text_kv_addresses) {
+            pages += program->text_kv_addresses->mapped_pages(*kv.first);
+        }
+        if (kv.second && program->backend_kv_addresses) {
+            pages += program->backend_kv_addresses->mapped_pages(*kv.second);
+        }
+        return pages;
+    };
+    std::vector<std::size_t> eviction_order = victim_order;
+    std::stable_sort(eviction_order.begin(), eviction_order.end(),
+                     [&](std::size_t left, std::size_t right) {
+                         return victim_size(left) < victim_size(right);
+                     });
+
     // Phase 1 — device waterfall: while the device is over-committed, demote the
     // lowest-value victims whose retained (non-evicting, no-new-checkpoint-drop)
     // decision strictly reduces device over-commitment. Host impact is deferred to
@@ -1405,12 +1439,14 @@ PressurePlanningSessionImpl<NINFER_QWEN36_VARIANT>::deterministic_target(
     // adds checkpoint drops and strictly reduces the total over-commitment. This pays
     // the Host debt deferred by phase 1 (and any Host pressure the admission itself
     // brings) without evicting any context — KV stays cached, prefixes stay reusable.
+    // Victims are considered in eviction order (smallest first) so a host-relief
+    // eviction takes the least destructive victim available, not the lowest ID.
     for (std::size_t step = 0; step < maximum_steps; ++step) {
         const detail::PhysicalResources residual =
             projected_residual(choice_scratch, std::nullopt, nullptr);
         if (feasible(residual)) { break; }
         std::optional<Selection> selected;
-        for (const std::size_t victim_index : victim_order) {
+        for (const std::size_t victim_index : eviction_order) {
             CandidateVictimOptions& victim = options.victims[victim_index];
             const std::uint16_t current_choice = choice_scratch[victim_index];
             const PressureDecision* current =
@@ -1426,9 +1462,17 @@ PressurePlanningSessionImpl<NINFER_QWEN36_VARIANT>::deterministic_target(
                     // over-commitment) by evicting the lowest-value victim whose eviction
                     // frees Host bytes. Private victims only — the shared system prefix
                     // and live mains' shared base must survive (their pages are not
-                    // exclusive to this owner anyway). Never undo a phase 1 demote.
-                    if (candidate.effect.removed.host.kv_bytes == 0) { continue; }
-                    if (current != nullptr && !current->evicts_continuation) { continue; }
+                    // exclusive to this owner anyway). A demoted victim may be evicted too,
+                    // and is in fact the preferred target: the dead subs Phase 1 demoted
+                    // have ~0 exclusive Host (their pages overlap the shared prefix), but
+                    // replacing their demote with an eviction drops the whole demote's Host
+                    // demand — closing the squeeze without touching a live main. Smallest
+                    // victims are tried first.
+                    const bool removes_demote_host =
+                        current != nullptr && current->effect.added.host.kv_bytes != 0;
+                    if (candidate.effect.removed.host.kv_bytes == 0 && !removes_demote_host) {
+                        continue;
+                    }
                     if (owners[options.victims[victim_index].owner_index].shared) { continue; }
                 } else {
                     const bool adds_drops    = candidate.checkpoint_drops > prior_drops;
@@ -1453,15 +1497,16 @@ PressurePlanningSessionImpl<NINFER_QWEN36_VARIANT>::deterministic_target(
         commit_pages(selected->victim_index, selected->decision);
     }
 
-    // Phase 3 — evict: last resort. While still infeasible, evict the lowest-value
-    // victims (in value order) whose eviction strictly reduces the total over-commitment.
-    // Both tiers are full and everything retainable has been retained at this point.
+    // Phase 3 — evict: last resort. While still infeasible, evict the smallest
+    // victims first (eviction order) whose eviction strictly reduces the total
+    // over-commitment. Both tiers are full and everything retainable has been
+    // retained at this point.
     for (std::size_t step = 0; step < maximum_steps; ++step) {
         const detail::PhysicalResources residual =
             projected_residual(choice_scratch, std::nullopt, nullptr);
         if (feasible(residual)) { break; }
         std::optional<Selection> selected;
-        for (const std::size_t victim_index : victim_order) {
+        for (const std::size_t victim_index : eviction_order) {
             const CandidateVictimOptions& victim = options.victims[victim_index];
             if (victim.eviction_choice == 0 || victim.eviction_choice > victim.decisions.size()) {
                 continue;
