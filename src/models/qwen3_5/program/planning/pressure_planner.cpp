@@ -771,7 +771,11 @@ PressurePlanningSessionImpl::graceful_fallback_target(
 inline std::optional<qwen3_5::PressureTargetHandle>
 PressurePlanningSessionImpl::deterministic_target(
     runtime::PlanningCandidateId admission,
-    std::span<const runtime::PlanningOwnerId> preferred_owner_ids) {
+    std::span<const runtime::PlanningOwnerId> preferred_owner_ids,
+    std::span<const std::uint32_t> preferred_owner_weights) {
+    if (preferred_owner_ids.size() != preferred_owner_weights.size()) {
+        throw std::logic_error("pressure preferred owner weights are misaligned");
+    }
     if (scratch_live) { throw std::logic_error("pressure expansion scratch is still live"); }
     const std::uint32_t selected_candidate = candidate_index(admission);
     populate_options(selected_candidate);
@@ -803,6 +807,16 @@ PressurePlanningSessionImpl::deterministic_target(
         }
     }
     for (std::size_t index = 0; index < options.victims.size(); ++index) { append_victim(index); }
+
+    std::fprintf(stderr, "[PP] plan cand=%u demand_pages=%u victims=%zu owners=",
+                 selected_candidate, candidate.demand.active_entitlement.device.main_kv_pages,
+                 options.victims.size());
+    for (std::size_t index = 0; index < options.victims.size(); ++index) {
+        const Owner& owner = owners[options.victims[index].owner_index];
+        std::fprintf(stderr, "%s%u%s", index == 0 ? "" : ",", owner.id.value,
+                     owner.shared ? "s" : "p");
+    }
+    std::fprintf(stderr, "\n");
 
     const auto projected_residual = [&](std::span<const std::uint16_t> target_choices,
                                         std::optional<std::size_t> override_owner,
@@ -910,6 +924,11 @@ PressurePlanningSessionImpl::deterministic_target(
         } else {
             residual.host.kv_bytes = std::max(residual.host.kv_bytes, host_det_shortfall);
         }
+        std::fprintf(stderr,
+                     "[PP] hostfit add=%zu free=%zu short=%zu det=%zu alloc=%d evcover=%d fits=%d\n",
+                     added_host_kv, host_free_bytes, host_shortfall, host_det_shortfall,
+                     allocator_fits ? 1 : 0, eviction_frees_cover ? 1 : 0,
+                     host_fits ? 1 : 0);
         return residual;
     };
     const detail::PhysicalResources capacity = program->admission_capacity();
@@ -1209,6 +1228,24 @@ PressurePlanningSessionImpl::deterministic_target(
         return out;
     };
 
+    const auto pp_selection = [&](const char* tag, const Selection& sel) {
+        const PressureDecision& d = sel.decision;
+        const Owner& o = owners[options.victims[sel.victim_index].owner_index];
+        const auto victim_kv = owner_kv(sel.victim_index);
+        std::uint32_t vmain = 0;
+        if (victim_kv.first && program->text_kv_addresses) {
+            vmain = program->text_kv_addresses->mapped_pages(*victim_kv.first);
+        }
+        std::fprintf(stderr,
+                     "[PP] %s victim=%u%s evict=%d main_pages=%u dev_main_rem=%u dev_back_rem=%u "
+                     "state_rem=%u host_add=%zu host_rem=%zu drops=%u\n",
+                     tag, o.id.value, o.shared ? "s" : "p", d.evicts_continuation ? 1 : 0, vmain,
+                     d.effect.removed.device.main_kv_pages,
+                     d.effect.removed.device.backend_kv_pages,
+                     d.effect.removed.device.state_slots, d.effect.added.host.kv_bytes,
+                     d.effect.removed.host.kv_bytes, d.checkpoint_drops);
+    };
+
     // Eviction order: smallest victims first (least destructive), stable within the value
     // ranking. The hit-count model is degenerate for this workload (no selections observed,
     // so value order reduces to ID order and evicts the largest live mains first). Preferring
@@ -1225,9 +1262,38 @@ PressurePlanningSessionImpl::deterministic_target(
         return pages;
     };
     std::vector<std::size_t> eviction_order = victim_order;
+    // Value-ranked eviction order: retention weight is the primary key (shared/absent
+    // weight sheds first, recently-active live sessions last), with size as a tiebreak
+    // within a weight so the least destructive victim of a class is evicted first. A
+    // pure size key would reorder across weights and evict a small live main before a
+    // larger idle one on a saturated instance; a pure value key would pick an arbitrary
+    // critical main at the finalize squeeze instead of the smallest one.
+    std::vector<std::uint32_t> victim_weights(options.victims.size(), 0);
+    for (std::size_t index = 0; index < preferred_owner_ids.size() && index < preferred_owner_weights.size();
+         ++index) {
+        const auto found = std::find_if(
+            options.victims.begin(), options.victims.end(), [&](const auto& victim) {
+                return victim.owner_index < owners.size() &&
+                       owners[victim.owner_index].id == preferred_owner_ids[index];
+            });
+        if (found != options.victims.end()) {
+            victim_weights[static_cast<std::size_t>(found - options.victims.begin())] =
+                preferred_owner_weights[index];
+        }
+    }
     std::stable_sort(eviction_order.begin(), eviction_order.end(),
                      [&](std::size_t left, std::size_t right) {
-                         return victim_size(left) < victim_size(right);
+                         const std::uint32_t left_weight  = victim_weights[left];
+                         const std::uint32_t right_weight = victim_weights[right];
+                         if (left_weight != right_weight) { return left_weight < right_weight; }
+                         // Live sessions (weight 16): least destructive first (smallest) so
+                         // the finalize squeeze sheds the smallest main. Dead weight (≤ 4):
+                         // shed the LARGEST first so a small freshly-started session is not
+                         // the first RecentPrivate victim on a saturated instance.
+                         const std::uint64_t left_size  = victim_size(left);
+                         const std::uint64_t right_size = victim_size(right);
+                         if (left_weight <= 4) { return left_size > right_size; }
+                         return left_size < right_size;
                      });
 
     // Phase 1 — device waterfall: while the device is over-committed, demote the
@@ -1277,6 +1343,7 @@ PressurePlanningSessionImpl::deterministic_target(
             if (selected) { break; }
         }
         if (!selected) { break; }
+        pp_selection("P1", *selected);
         choice_scratch[selected->victim_index] = intern_selection(*selected);
         commit_pages(selected->victim_index, selected->decision);
     }
@@ -1340,6 +1407,7 @@ PressurePlanningSessionImpl::deterministic_target(
             if (selected) { break; }
         }
         if (!selected) { break; }
+        pp_selection("P2", *selected);
         choice_scratch[selected->victim_index] = intern_selection(*selected);
         commit_pages(selected->victim_index, selected->decision);
     }
@@ -1371,9 +1439,187 @@ PressurePlanningSessionImpl::deterministic_target(
             break;
         }
         if (!selected) { break; }
+        pp_selection("P3", *selected);
         choice_scratch[selected->victim_index] =
             options.victims[selected->victim_index].eviction_choice;
     }
+
+    // Phase 4 — Host-placement verification. The byte model (projected_residual) can
+    // declare a plan Host-feasible when the real Host arena cannot place its demotes:
+    // free space may be fragmented, and evicting shared victims frees no exclusive Host
+    // (their pages are still referenced by the live main's prefix). Ask the real
+    // allocator; if the plan's demotes do not fit, run real composition, and if that
+    // still fails convert the demoted victim with the largest Host demand into an
+    // eviction (drops its whole Host demand and frees more device), re-checking until
+    // the plan is genuinely feasible or no demote remains. Converges monotonically and
+    // only destroys what the Host tier cannot retain.
+    std::vector<std::uint32_t> phase4_main_pages;
+    std::vector<std::uint32_t> phase4_back_pages;
+    const auto collect_demotes = [&]() {
+        phase4_main_pages.clear();
+        phase4_back_pages.clear();
+        for (std::size_t index = 0; index < options.victims.size(); ++index) {
+            const std::uint16_t choice = choice_scratch[index];
+            if (choice == 0) { continue; }
+            const PressureDecision& decision = options.victims[index].decisions[choice - 1U];
+            if (decision.evicts_continuation) { continue; }
+            for (const PressureKVDecision& kv : decision.main_kv_changes) {
+                if (kv.kind == PressureKVDecisionKind::DemoteToHost && kv.page_count != 0) {
+                    phase4_main_pages.push_back(kv.page_count);
+                }
+            }
+            for (const PressureKVDecision& kv : decision.backend_kv_changes) {
+                if (kv.kind == PressureKVDecisionKind::DemoteToHost && kv.page_count != 0) {
+                    phase4_back_pages.push_back(kv.page_count);
+                }
+            }
+        }
+    };
+    const auto compose_accepts = [&]() {
+        std::vector<const ContinuationHandle*> p_owners;
+        std::vector<runtime::PlanningOwnerId> p_ids;
+        std::vector<const PressureDecision*> p_decisions;
+        std::vector<const SharedPrefixHandle*> s_owners;
+        std::vector<runtime::PlanningOwnerId> s_ids;
+        std::vector<const PressureDecision*> s_decisions;
+        for (std::size_t index = 0; index < options.victims.size(); ++index) {
+            const std::uint16_t choice = choice_scratch[index];
+            if (choice == 0) { continue; }
+            const CandidateVictimOptions& victim = options.victims[index];
+            if (victim.owner_index >= owners.size()) {
+                throw std::logic_error("pressure planning victim owner is invalid");
+            }
+            const Owner& owner             = owners[victim.owner_index];
+            const PressureDecision* decision = &victim.decisions[choice - 1U];
+            if (owner.shared) {
+                s_owners.push_back(owner.shared_handle);
+                s_ids.push_back(owner.id);
+                s_decisions.push_back(decision);
+            } else {
+                p_owners.push_back(owner.private_handle);
+                p_ids.push_back(owner.id);
+                p_decisions.push_back(decision);
+            }
+        }
+        const PhysicalCandidateBinding& binding = candidates[selected_candidate];
+        if (binding.admission != nullptr) {
+            AdmissionCandidate copy(std::make_unique<AdmissionCandidateImpl>(*binding.admission));
+            if (!program->compose_pressure_candidate(*copy.impl_, p_owners, p_ids, p_decisions,
+                                                     s_owners, s_ids, s_decisions)) {
+                return false;
+            }
+            return copy.impl_->blocked_host_allocation_bytes == 0 &&
+                   program->physical_peak_fits(copy.impl_->demand.physical_peak_additional);
+        }
+        if (binding.capture != nullptr) {
+            CapturePressureCandidate copy(
+                std::make_unique<CapturePressureCandidateImpl>(*binding.capture));
+            if (!program->compose_pressure_candidate(*copy.impl_, p_owners, p_ids, p_decisions,
+                                                     s_owners, s_ids, s_decisions)) {
+                return false;
+            }
+            return copy.impl_->blocked_host_allocation_bytes == 0 &&
+                   program->physical_peak_fits(copy.impl_->demand.physical_peak_additional);
+        }
+        return false;
+    };
+    collect_demotes();
+    if (!phase4_main_pages.empty() || !phase4_back_pages.empty()) {
+        std::fprintf(stderr, "[PP] P4 host_demand_pages=%zu+%zu\n", phase4_main_pages.size(),
+                     phase4_back_pages.size());
+        if (!program->host_kv_requests_fit(phase4_main_pages, phase4_back_pages)) {
+            std::fprintf(stderr, "[PP] P4 allocator_rejects_demotes\n");
+            for (std::size_t step = 0; step < maximum_steps; ++step) {
+                if (compose_accepts()) { break; }
+                // First make room for the demotes by evicting undecided dead weight
+                // (weight < 16 — never a live session). At a finalize squeeze the host
+                // arena is fragmented by the shared subs' KV — the mains' demote cannot
+                // be placed even though bytes are free. Evicting a sub frees device
+                // (fewer demotes needed) and its Host extents. Live (weight 16)
+                // undecided victims are excluded here: they are the last resort and are
+                // only shed when no demote could absorb the shortfall, so a finalize
+                // never destroys an active session's main while a dead demote could
+                // have been converted instead.
+                std::optional<std::size_t> evict;
+                for (const std::size_t victim_index : eviction_order) {
+                    if (victim_weights[victim_index] >= 16) { continue; }
+                    if (choice_scratch[victim_index] != 0) { continue; }
+                    const CandidateVictimOptions& victim = options.victims[victim_index];
+                    if (victim.eviction_choice == 0) { continue; }
+                    evict = victim_index;
+                    break;
+                }
+                if (evict) {
+                    const Owner& evict_owner = owners[options.victims[*evict].owner_index];
+                    std::fprintf(stderr, "[PP] P4 evict=%u%s\n", evict_owner.id.value,
+                                 evict_owner.shared ? "s" : "p");
+                    choice_scratch[*evict] = options.victims[*evict].eviction_choice;
+                    continue;
+                }
+                // No undecided dead weight left: convert the least-valuable host-adding
+                // demote to an eviction (drops its whole Host demand). The eviction
+                // order ranks dead demotes before live ones, so a live session's demote
+                // is only touched after every dead demote is exhausted.
+                std::optional<std::size_t> convert;
+                for (const std::size_t victim_index : eviction_order) {
+                    const std::uint16_t choice = choice_scratch[victim_index];
+                    if (choice == 0) { continue; }
+                    const CandidateVictimOptions& victim = options.victims[victim_index];
+                    const PressureDecision& decision = victim.decisions[choice - 1U];
+                    if (decision.evicts_continuation) { continue; }
+                    if (decision.effect.added.host.kv_bytes == 0) { continue; }
+                    if (victim.eviction_choice == 0) { continue; }
+                    convert = victim_index;
+                    break;
+                }
+                if (!convert) {
+                    // Absolute last resort: shed an undecided live (weight 16) victim.
+                    // Only reached when no dead weight and no demote could resolve the
+                    // shortfall — the Host tier genuinely cannot retain the live mains.
+                    std::optional<std::size_t> live_evict;
+                    for (const std::size_t victim_index : eviction_order) {
+                        if (choice_scratch[victim_index] != 0) { continue; }
+                        const CandidateVictimOptions& victim = options.victims[victim_index];
+                        if (victim.eviction_choice == 0) { continue; }
+                        live_evict = victim_index;
+                        break;
+                    }
+                    if (live_evict) {
+                        const Owner& evict_owner =
+                            owners[options.victims[*live_evict].owner_index];
+                        std::fprintf(stderr, "[PP] P4 live_evict=%u%s\n", evict_owner.id.value,
+                                     evict_owner.shared ? "s" : "p");
+                        choice_scratch[*live_evict] =
+                            options.victims[*live_evict].eviction_choice;
+                        continue;
+                    }
+                    std::fprintf(stderr, "[PP] P4 no_convertible_demote\n");
+                    break;
+                }
+                const Owner& convert_owner = owners[options.victims[*convert].owner_index];
+                std::fprintf(stderr, "[PP] P4 convert=%u%s host=%llu\n",
+                             convert_owner.id.value, convert_owner.shared ? "s" : "p",
+                             static_cast<unsigned long long>(
+                                 options.victims[*convert]
+                                     .decisions[choice_scratch[*convert] - 1U]
+                                     .effect.added.host.kv_bytes));
+                choice_scratch[*convert] = options.victims[*convert].eviction_choice;
+            }
+        }
+    }
+
+    std::fprintf(stderr, "[PP] final cand=%u choices=", selected_candidate);
+    for (std::size_t index = 0; index < options.victims.size(); ++index) {
+        const Owner& owner = owners[options.victims[index].owner_index];
+        const auto victim_kv = owner_kv(index);
+        std::uint32_t vmain = 0;
+        if (victim_kv.first && program->text_kv_addresses) {
+            vmain = program->text_kv_addresses->mapped_pages(*victim_kv.first);
+        }
+        std::fprintf(stderr, "%s%u%s(%u):%u", index == 0 ? "" : ",", owner.id.value,
+                     owner.shared ? "s" : "p", vmain, choice_scratch[index]);
+    }
+    std::fprintf(stderr, "\n");
 
     TargetNode* existing = find_target(selected_candidate, choice_scratch);
     const std::size_t maximum =

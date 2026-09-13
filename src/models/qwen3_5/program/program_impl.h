@@ -1312,7 +1312,8 @@ struct PressurePlanningSessionImpl {
                              std::span<const runtime::PlanningOwnerId> preferred_owner_ids);
     [[nodiscard]] std::optional<qwen3_5::PressureTargetHandle>
     deterministic_target(runtime::PlanningCandidateId candidate,
-                         std::span<const runtime::PlanningOwnerId> preferred_owner_ids);
+                         std::span<const runtime::PlanningOwnerId> preferred_owner_ids,
+                         std::span<const std::uint32_t> preferred_owner_weights);
     [[nodiscard]] runtime::PressureTargetGuidance guidance(qwen3_5::PressureTargetHandle target);
     [[nodiscard]] qwen3_5::AssessedPressureTarget assess(qwen3_5::PressureTargetHandle target);
     [[nodiscard]] qwen3_5::PreparedPressureExpansion

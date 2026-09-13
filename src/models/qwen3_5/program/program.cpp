@@ -166,9 +166,10 @@ PressurePlanningSession::graceful_fallback_target(
 std::optional<PressureTargetHandle>
 PressurePlanningSession::deterministic_target(
     runtime::PlanningCandidateId candidate,
-    std::span<const runtime::PlanningOwnerId> preferred_owner_ids) {
+    std::span<const runtime::PlanningOwnerId> preferred_owner_ids,
+    std::span<const std::uint32_t> preferred_owner_weights) {
     if (impl_ == nullptr) { throw std::logic_error("pressure planning session is empty"); }
-    return impl_->deterministic_target(candidate, preferred_owner_ids);
+    return impl_->deterministic_target(candidate, preferred_owner_ids, preferred_owner_weights);
 }
 
 runtime::PressureTargetGuidance PressurePlanningSession::guidance(PressureTargetHandle target) {
