@@ -865,6 +865,8 @@ struct AbortResult {
     runtime::ConsumeStatus status = runtime::ConsumeStatus::InvariantMismatch;
     GenerationTimings timings;
     SpeculativeStats speculative;
+    ContinuationSummary summary;
+    std::optional<ContinuationHandle<Variant>> continuation;
 };
 
 template <class Variant>
