@@ -234,22 +234,44 @@ public:
         }
         std::sort(preferred_owners.begin(), preferred_owners.end(),
                   [](const auto* left, const auto* right) {
+                      // Rank least-valuable first (the preferred victim order). Retention
+                      // weight leads (shed the disposable/shared classes before live work);
+                      // then recency — least recently materialized first, with never-hit
+                      // (epoch 0) treated as freshly admitted and protected. The hit-count
+                      // counter is global and monotonic, so a live continuation's epochs
+                      // always exceed an idle one's frozen values: under sustained pressure
+                      // the planner sheds idle dead weight before the currently-stepping
+                      // sessions (a total-hit-count key does the opposite — a long-idle
+                      // context accumulates hits, then a freshly-active one with few hits
+                      // ranks as the better victim).
+                      const std::uint64_t left_epoch =
+                          left->last_hit_epoch == 0 ? ~std::uint64_t{0} : left->last_hit_epoch;
+                      const std::uint64_t right_epoch =
+                          right->last_hit_epoch == 0 ? ~std::uint64_t{0} : right->last_hit_epoch;
                       return std::tuple{
-                                 left->selected_hit_count,
-                                 left->explicit_shared_credit ? 1U : 0U,
                                  left->private_retention_weight,
-                                 left->last_hit_epoch,
+                                 left_epoch,
+                                 left->explicit_shared_credit ? 1U : 0U,
+                                 left->selected_hit_count,
                                  left->owner.value,
                              } < std::tuple{
-                                     right->selected_hit_count,
-                                     right->explicit_shared_credit ? 1U : 0U,
                                      right->private_retention_weight,
-                                     right->last_hit_epoch,
+                                     right_epoch,
+                                     right->explicit_shared_credit ? 1U : 0U,
+                                     right->selected_hit_count,
                                      right->owner.value,
                                  };
                   });
         std::vector<PlanningOwnerId> preferred_owner_ids;
         preferred_owner_ids.reserve(preferred_owners.size());
+        std::fprintf(stderr, "[PP] val");
+        for (const MaterializationOwnerPolicy* policy : preferred_owners) {
+            std::fprintf(stderr, " %u:%llu:%u:%llu", policy->owner.value,
+                         static_cast<unsigned long long>(policy->selected_hit_count),
+                         policy->private_retention_weight,
+                         static_cast<unsigned long long>(policy->last_hit_epoch));
+        }
+        std::fprintf(stderr, "\n");
         for (const MaterializationOwnerPolicy* policy : preferred_owners) {
             preferred_owner_ids.push_back(policy->owner);
         }
@@ -287,12 +309,19 @@ public:
         const Clock::time_point deterministic_started = Clock::now();
         MaterializationStopReason stop_reason         = MaterializationStopReason::QueueExhausted;
         bool budget_exhausted                         = false;
+        std::vector<std::uint32_t> preferred_owner_weights;
+        preferred_owner_weights.reserve(preferred_owners.size());
+        for (const MaterializationOwnerPolicy* policy : preferred_owners) {
+            preferred_owner_weights.push_back(policy->private_retention_weight);
+        }
         for (const IdentityRoot& root : roots) {
             if (!root.expandable) { continue; }
             const std::optional<PressureTargetHandle> deterministic =
                 session.deterministic_target(candidates[root.candidate_index].id,
-                                             preferred_owner_ids);
+                                             preferred_owner_ids, preferred_owner_weights);
             if (!deterministic) {
+                std::fprintf(stderr, "[pl] deterministic NULLOPT cand=%u\n",
+                             candidates[root.candidate_index].id.value);
                 continue;
             }
             AssessedPressureTarget assessed            = session.assess(*deterministic);
@@ -310,7 +339,12 @@ public:
                 goal = logical_goal(assessment.candidate, assessment.source_mode,
                                     assessment.owner_outcomes);
             }
-            if (!goal) { continue; }
+            if (!goal) {
+                std::fprintf(stderr, "[pl] DETERMINISTIC INFEASIBLE cand=%u status=%d\n",
+                             candidates[root.candidate_index].id.value,
+                             static_cast<int>(assessment.physical_status));
+                continue;
+            }
             if (cost.less(incumbent.cost)) {
                 incumbent = make_incumbent(*deterministic, root.candidate_index, assessment,
                                            std::move(assessed), cost, *goal);
@@ -342,6 +376,10 @@ public:
                          FinalScheduleIntent{.shared_capture_frontiers = shared_frontiers});
         if (!sealed) { throw std::logic_error("selected pressure target could not be sealed"); }
 
+        if (incumbent.root_maximal) {
+            std::fprintf(stderr, "[pl] MAXIMAL FALLBACK SELECTED cand=%u\n",
+                         candidates[incumbent.candidate_index].id.value);
+        }
         MaterializationDiagnostics diagnostics = make_diagnostics(
             incumbent.cost, targets_evaluated, projection_work, planning_started, search_elapsed_ns,
             stop_reason, budget_exhausted, incumbent.degradation_units, incumbent.root_maximal);
