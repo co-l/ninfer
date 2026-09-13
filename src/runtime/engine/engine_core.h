@@ -1295,6 +1295,8 @@ private:
         return request;
     }
 
+    static constexpr std::uint32_t kCaptureEvictionBudgetFloor = 512;
+
     void reserve_active_capture(const std::shared_ptr<Request>& request, CaptureOffer&& offer,
                                 EngineRequestState post_capture_state) {
         if (!request->lane || !request->sequence || request->capture_pending ||
@@ -1317,7 +1319,8 @@ private:
                 : static_cast<std::uint32_t>(blocked);
         const auto reserved = resources_.reserve_active_capture(
             *instance_.program, *request->lane, std::move(offer), blocked_runnable_requests,
-            CancellationFlagView{&request->cancelled});
+            CancellationFlagView{&request->cancelled},
+            request->budget->remaining() >= kCaptureEvictionBudgetFloor);
         if (reserved == ResourceManagement::ActiveCaptureReserveResult::Skipped) { return; }
         request->capture_pending    = true;
         request->post_capture_state = post_capture_state;

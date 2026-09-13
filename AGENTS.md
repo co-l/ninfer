@@ -144,6 +144,144 @@ Read the authority relevant to the current decision; this is not a mandatory rea
 Use `cmake --build <build-dir> -j` by default. Adjust parallelism when actual resource pressure
 causes failures or interferes with the task, and briefly explain why.
 
+## How to validate against the real deployment
+
+The end-to-end truth is the engine serving live on the RTX 5090 box; the
+measurement harness is the **`cache-pressure`** project at `../cache-pressure`
+(a `uv` Python project — run tools with `uv run <tool>`, never `uvx --from .`
+while developing, per its own AGENTS.md). All four benches run from the
+workstation against the box endpoint and exit non-zero on failure. They run
+**back-to-back on the same server, without restarts**: a dirty cache is the
+norm, and a change is validated only when **all four pass dirty on the same
+image**.
+
+| Bench | Command (`--base-url http://192.168.1.238:8000/v1` implied) | What it proves | Pass bar |
+|---|---|---|---|
+| `agent-sim` | `uv run agent-sim --sessions 4 --main-tokens 150000 --sub-tokens 40000` | four concurrent 150K-token agent sessions survive cache pressure: main-continuation reuse and finalize survival | 4/4 finalize ≥ 98.6% reuse, 116/116 mains, zero `selected_maximal_fallback` (ground truth via `--ninfer-log`) |
+| `abort-sim` | `uv run abort-sim --context-tokens 40000 --thinking-tokens 500 --runs 2` | a mid-thinking client abort loses no processed prefix: re-orientation re-sends the captured partial turn and must reuse it | every run reuses ≥ 95% of the re-prompt and never takes the `root` path (see `../5090/SESSION-2026-09-13-abort-repro.md`) |
+| `needle-test` | `uv run needle-test --lengths 50000,100000,200000` | end-to-end long-context retrieval stays intact (hidden secret codes at depth) — the cache is not masking a broken prefill | every length PASS |
+| `cache-pressure` | `uv run cache-pressure --kv-size 460000` | retention under real overflow pressure: hydrate `ceil(kv-size/8001)+5` ~8K contexts (63 at 460K), re-send in reverse order | 100% retained (63/63 at 460K), ≈ 108% of the advertised capacity — on a cache already holding other dead content (no restart) |
+
+Remote work runs by direct call (agent behaviour):
+
+- **Direct call, never background.** Every box command — `./deploy.sh`,
+  `./start.sh`, `./stop.sh`, and each bench — is a single `run_command`
+  with a large timeout (`./deploy.sh`/`./start.sh`/`./stop.sh`:
+  ≥ 600000 ms; benches: ≥ 3600000 ms). The call blocks and its output
+  streams **live** in the session: that is both the progress view and the
+  wait — the tool returns only when the command exits, carrying the full
+  transcript + exit code.
+- **No `tail`, no `grep`, no ssh-peeking, no sleep-polling.** Do not launch
+  things via `background_process` and then poll the box with `sleep` +
+  `tail`/`grep` to track progress, and do not interrupt a running call to
+  "check" on it. The streamed output IS the progress. (The only `tail` in
+  the repo lives inside `start.sh`, whose job is to return once
+  `listening on` appears — the agent never tails.)
+- Prefix `env PYTHONUNBUFFERED=1` for Python benches (e.g. `env
+  PYTHONUNBUFFERED=1 uv run agent-sim ...`): Python block-buffers stdout
+  when piped, so without it the stream arrives in ~8 KiB chunks, hiding
+  progress. `agent-sim` also prints one per-turn line per completed turn
+  when the TTY view is off (see `../cache-pressure/AGENTS.md`).
+- Announce the command + expected duration before launching; on return, read
+  the exit code and summary for the verdict (a bench exits non-zero on
+  failure). A hung command blocks until the timeout — size it to the job.
+
+Hygiene (results are only comparable when these hold):
+
+- **Dirty state is the norm — never restart to make a bench pass.** A correct
+  cache evicts the oldest *dead* content to make room for a new working set,
+  so every bench must pass on a cache already occupied by prior work (a bench
+  that only passes cold is hiding an engine defect — the host tier
+  accumulating dead content and evicting the wrong things — not a hygiene
+  requirement). The historical "fresh server required" caveat on retention
+  (2/65 after agent-sim) was exactly that defect and is superseded by this
+  criterion.
+- **Ground truth comes from the request log**, not the API:
+  `usage.prompt_tokens_details.cached_tokens` cannot distinguish a device hit
+  from a RAM-tier restore. The box writes `--request-log-jsonl
+  /logs/requests.jsonl` (host path `/home/conrad/dev/nicefox-5090-prod/logs/requests.jsonl`,
+  appended, cumulative across runs — slice by timestamps or line offsets)
+  with `computed_prefill_tokens`,
+  `prefix_cache_hit_tokens`, `prefix_reuse_path`. Pass `--ninfer-log`
+  (agent-sim) or fetch the tail and `abort-sim --annotate run.json
+  --ninfer-log <tail>` for the ground-truth reuse class (`hit` / `partial` /
+  `miss`).
+- `--salt` gives deterministic A/B (identical planned inputs; model-generated
+  replies still differ, so cross-run prefixes are not byte-identical).
+- `abort-sim`: the probe re-prompt uses `max_tokens: 1` because the engine
+  treats `max_tokens: 0` as a no-op that runs no prefill at all
+  (`Engine::submit` short-circuit; the Anthropic endpoint rejects it as
+  `cache_prewarm_not_supported`).
+- `needle-test`: keep lengths under the served `max_model_len` (the default
+  50K–450K sweep overflows this deployment's 262144 context — pass
+  `--lengths` as above).
+- **The maintainer agent may run on the box itself.** If the agent's own
+  model is served by the box (e.g. this repo's `qwen3.8-27b`), the agent's
+  inference appears in the request log and its context occupies the cache:
+  the box is never idle while the agent generates, its own requests must be
+  excluded from bench analysis (slice by the bench's own timestamps/salts),
+  and a cache-overflowing bench run will evict the agent's own context
+  (its next turn re-prefills). Run benches from a session that does not
+  share the box's serving instance.
+- One engine server runs on the box at a time (ninfer or vLLM); the launch
+  scripts stop the other.
+
+### The deployment (box `gaming_pc`, 192.168.1.238)
+
+| | |
+|---|---|
+| hardware | RTX 5090 (32 GiB), 30 GiB RAM; box must be ON — wake with `../5090/poweron-gaming-pc.sh` (WoL + 400 W cap) |
+| source tree | `/home/conrad/dev/nicefox-5090-prod` (plain tree, **not** a git repo; a clean copy of this repository — git-tracked files only, deployed by `./deploy.sh` — plus the box-local `models/` + `logs/`; the cache-fix planner work is committed on the `nicefox` remote, no patch files) |
+| artifact | `models/qwen3_8_27b_nvfp4.ninfer` (21.5 GiB, Qwen3.8-27B NVFP4) |
+| image | `localhost/ninfer:local` (Dockerfile: CUDA 13.1.2-devel/Ubuntu 24.04, `podman build --jobs 4` with ninja parallelism via `BUILD_PARALLEL`, default 16; measured: compile peaks at ~7 GiB RAM and takes ~4 min — CPU-bound, not RAM-bound) |
+| container | `ninfer-serve` via `./start.sh` (launch) / `./stop.sh` (stop) in this repo (rootful podman, GPU 0, ports 8000, mounts `models/` ro + `logs/`); env overrides `NINFER_CONCURRENCY` (4), `NINFER_KV_CAPACITY` (460000), `NINFER_KV_DTYPE` (nvfp4), `NINFER_DEVICE_STATE_SLOTS` (4), `NINFER_VISION` (1) |
+| request log | `/home/conrad/dev/nicefox-5090-prod/logs/requests.jsonl` |
+| health | `curl -sf localhost:8000/health` on the box (model load is seconds; serve log shows `engine ready`) |
+
+Serving flags (as deployed): `--max-context 262144 --kv-capacity 460000
+--max-concurrency 4 --max-pending-requests 16 --pending-timeout-ms 600000
+--device-state-slots 4 --host-state-slots 96 --host-kv-mib 12288
+--max-private-continuations 128 --max-shared-prefixes 64 --kv-dtype nvfp4
+--spec mtp --draft-tokens 4 --lm-head-draft --preserve-thinking --vision`.
+Sweep-derived floors in `ninfer-serve.sh`'s header: 460K is the VRAM-safe
+device pool (hard limit ≈ 469K at C=4), 96 host state slots and 12 GiB host
+KV are mandatory for finalize survival, `--max-private-continuations 128` is
+required by the 65×8K retention set, and no container memory limit is set on
+purpose (the pinned state+KV footprint needs the whole box).
+
+### Build and deploy flow
+
+The box image is built from this repository's sources only. The box tree is a
+clean copy of this repo (git-tracked files, `--delete` sync) plus the
+box-local `models/` and `logs/`; there is no patch layer anymore — the
+cache-fix planner work is committed on the `nicefox` remote.
+
+1. Change the source and commit on `main` (the box only ever deploys the
+   committed tree).
+2. Deploy: `./deploy.sh` — rsyncs the tracked sources to
+   `gaming_pc:/home/conrad/dev/nicefox-5090-prod/`, stops `ninfer-serve`
+   (the serving footprint pins ~28 GiB; the compile alone is only ~7 GiB, but
+   server + build together exceed the box's 30 GiB), then builds
+   `localhost/ninfer:local` on the box
+   (`sudo podman build --jobs 4 -t ninfer:local .` with
+   `--build-arg BUILD_PARALLEL=$PARALLEL`, default 16 → ~4 min).
+   `./deploy.sh --dry-run` shows the sync plan without building. Env
+   overrides: `BOX`, `REMOTE_DIR`, `IMAGE`, `PARALLEL`. Box must be on
+   (`ssh gaming_pc`), else the script exits with a pointer to
+   `../5090/poweron-gaming-pc.sh`.
+3. Launch: `./start.sh` — launches `ninfer-serve` detached on the box and
+   returns once the log shows `listening on` (never tails forever). `./stop.sh`
+   stops it. Both live in this repo and embed the full serving recipe; the
+   box must be on (`ssh gaming_pc`) and port 8000 free (only one engine serves
+   at a time — stop vLLM/SGLang first if they own port 8000). Wait for
+   `engine ready` / `/health` OK.
+4. Validate from the workstation: the cache-pressure bench suite must pass
+   back-to-back on the same server, no restart — `agent-sim`, `needle-test`,
+   `cache-pressure` (see the table above; `abort-sim` is a known-open bug,
+   SESSION-2026-09-13-abort-repro.md, not part of the deploy gate).
+
+## Commits
+
 Use the selected Python 3.11 interpreter explicitly. On this machine it is
 `/home/neroued/miniconda3/envs/py311/bin/python`; the default shell's `python3` may be a different
 version. Use `python3` only after selecting the maintainer environment or checking its version.

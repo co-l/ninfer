@@ -827,7 +827,6 @@ ActiveCaptureResult ProgramImpl::publish_active_capture(ActiveCaptureTransaction
         prefill.next_capture >= prefill.capture_groups.size()) {
         throw std::logic_error("active capture offer ownership changed");
     }
-
     if (transaction.state_placement == qwen3_5::CaptureStatePlacement::HostSnapshot) {
         if (!transaction.state_snapshot || sequence.state.fork_pending ||
             sequence.state.read != transaction.source_state ||

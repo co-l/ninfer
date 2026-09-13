@@ -590,7 +590,6 @@ FinishResult ProgramImpl::finish(SequenceHandle sequence) noexcept {
     const std::uint32_t lane               = ContractAccess::lane(sequence).value;
     RequestControl& request                = requests[lane];
     SequenceState& state                   = active_sequence(lane);
-    const std::uint32_t continuation_index = active_continuations[lane];
     if (request.lifecycle != Lifecycle::Finishable) { return out; }
     if (!request.publish_continuation) {
         if (!clear_lane_strict(state, request)) { return out; }
@@ -606,26 +605,46 @@ FinishResult ProgramImpl::finish(SequenceHandle sequence) noexcept {
     // borrowed source cannot become this continuation's direct endpoint; fall back to terminal
     // discard if that publication invariant was not established.
     if (state.state.fork_pending && state.state.borrows_read()) { return out; }
+    std::optional<ContinuationHandle> retained =
+        retain_active_sequence_as_continuation(lane, request, state, out.summary);
+    if (!retained) { return out; }
+    out.continuation.emplace(std::move(*retained));
+    out.timings     = request.timings;
+    out.speculative = std::move(request.speculative_stats);
+    out.disposition = runtime::FinishDisposition::Catalogued;
+    advance_resource_revision();
+    out.status = runtime::ConsumeStatus::Consumed;
+    return out;
+}
+
+std::optional<ContinuationHandle>
+ProgramImpl::retain_active_sequence_as_continuation(std::uint32_t lane,
+                                                    RequestControl& request,
+                                                    SequenceState& state,
+                                                    qwen3_5::ContinuationSummary& summary) noexcept {
+    const std::uint32_t continuation_index = active_continuations[lane];
     try {
-        out.summary.long_anchors.reserve(state.long_anchors.size());
-    } catch (...) { return out; }
+        summary.long_anchors.reserve(state.long_anchors.size());
+    } catch (...) { return std::nullopt; }
     try {
         if (state.state.fork_pending) {
             const StateImageHandle source      = state.state.read;
             const StateImageHandle destination = state.state.write;
             state_store->abort_fork(source, destination);
-            if (!state_store->release(destination)) { return out; }
+            if (!state_store->release(destination)) { return std::nullopt; }
             // An active-capture source is still this sequence's primary lifetime. Publishing it
             // as the endpoint retains that direct ownership; surviving checkpoint references
             // still prevent exclusive attribution and release.
             state.state = ActiveStateBinding{.read = source, .write = source};
         }
         if (state.reserved_state) {
-            if (!state_store->release(*state.reserved_state)) { return out; }
+            if (!state_store->release(*state.reserved_state)) { return std::nullopt; }
             state.reserved_state.reset();
         }
         if (state.rewrite_state && *state.rewrite_state == state.state.read) {
-            if (state_store->checkpoint_references(*state.rewrite_state) == 0) { return out; }
+            if (state_store->checkpoint_references(*state.rewrite_state) == 0) {
+                return std::nullopt;
+            }
             state_store->release_checkpoint_reference(*state.rewrite_state);
             state.rewrite_state.reset();
             state.rewrite_checkpoint = {};
@@ -633,7 +652,7 @@ FinishResult ProgramImpl::finish(SequenceHandle sequence) noexcept {
         if (state_store->role(state.state.read) == StateImageRole::ActiveMutable) {
             state_store->freeze(state.state.read);
         } else if (state_store->role(state.state.read) != StateImageRole::CheckpointImmutable) {
-            return out;
+            return std::nullopt;
         }
         state.endpoint_valid = true;
         refresh_state_views(state);
@@ -642,9 +661,9 @@ FinishResult ProgramImpl::finish(SequenceHandle sequence) noexcept {
             backend_kv_addresses->set_checkpoint_requirement(*state.kv->backend,
                                                              backend_kv_valid(state));
         }
-        populate_continuation_summary(state, out.summary);
-        out.summary.active_references = 0;
-    } catch (...) { return out; }
+        populate_continuation_summary(state, summary);
+        summary.active_references = 0;
+    } catch (...) { return std::nullopt; }
     release_active_shared_references(state);
     release_sequence_growth_entitlement(state);
     unbind_sequence_kv(state);
@@ -652,17 +671,12 @@ FinishResult ProgramImpl::finish(SequenceHandle sequence) noexcept {
     request.optional_resources                  = {};
     request.lifecycle                           = Lifecycle::Empty;
     request.pending                             = {};
+    request.prefill.reset();
     continuation_slots[continuation_index].role = ContinuationSlotRole::Catalogued;
     active_continuations[lane]                  = continuation_capacity;
     invalidate_lane(lane);
-    out.continuation.emplace(ContractAccess::make_continuation(
-        this, continuation_index, continuation_slots[continuation_index].generation));
-    out.timings     = request.timings;
-    out.speculative = std::move(request.speculative_stats);
-    out.disposition = runtime::FinishDisposition::Catalogued;
-    advance_resource_revision();
-    out.status = runtime::ConsumeStatus::Consumed;
-    return out;
+    return ContractAccess::make_continuation(
+        this, continuation_index, continuation_slots[continuation_index].generation);
 }
 
 AbortResult ProgramImpl::abort(SequenceHandle sequence) noexcept {
@@ -676,6 +690,19 @@ AbortResult ProgramImpl::abort(SequenceHandle sequence) noexcept {
         return out;
     }
     SequenceState& state = active_sequence(lane);
+    if (request.publish_continuation &&
+        !(state.state.fork_pending && state.state.borrows_read())) {
+        std::optional<ContinuationHandle> retained =
+            retain_active_sequence_as_continuation(lane, request, state, out.summary);
+        if (retained) {
+            out.continuation.emplace(std::move(*retained));
+            out.timings     = request.timings;
+            out.speculative = std::move(request.speculative_stats);
+            advance_resource_revision();
+            out.status = runtime::ConsumeStatus::Consumed;
+            return out;
+        }
+    }
     if (!clear_lane_strict(state, request)) { return out; }
     out.timings     = request.timings;
     out.speculative = std::move(request.speculative_stats);

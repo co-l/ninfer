@@ -540,6 +540,9 @@ public:
     [[nodiscard]] DiscardResult abort_pending(PendingBatch&& pending) noexcept;
     [[nodiscard]] FinishResult finish(SequenceHandle sequence) noexcept;
     [[nodiscard]] AbortResult abort(SequenceHandle sequence) noexcept;
+    [[nodiscard]] std::optional<ContinuationHandle> retain_active_sequence_as_continuation(
+        std::uint32_t lane, RequestControl& request, SequenceState& state,
+        qwen3_5::ContinuationSummary& summary) noexcept;
     [[nodiscard]] ReleaseResult release_continuation(ContinuationHandle&& continuation) noexcept;
     [[nodiscard]] ReleaseResult release_shared_prefix(SharedPrefixHandle&& shared) noexcept;
     void fail_all_cleanup() noexcept;
@@ -1085,6 +1088,9 @@ private:
     void clear_execution_failure_lanes(std::span<const std::uint32_t> lanes) noexcept;
     [[nodiscard]] bool can_clear_lane_strict(const SequenceState& sequence) const;
     [[nodiscard]] bool clear_lane_strict(SequenceState& sequence, RequestControl& request) noexcept;
+    [[nodiscard]] std::optional<ContinuationHandle> retain_active_sequence_as_continuation(
+        std::uint32_t lane, RequestControl& request, SequenceState& state,
+        qwen3_6::ContinuationSummary& summary) noexcept;
     void clear_lane_best_effort(SequenceState& sequence, RequestControl& request) noexcept;
     void ordered_reset(SequenceState& sequence);
     [[nodiscard]] StateImageSelectors state_selectors(const SequenceState& sequence) const;
