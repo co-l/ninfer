@@ -504,10 +504,36 @@ public:
         program.finalize_context_transaction();
     }
 
+    bool try_evict_lowest_value_continuation(Program& program) {
+        std::optional<std::uint32_t> victim;
+        std::uint64_t best_weight = std::numeric_limits<std::uint64_t>::max();
+        for (std::uint32_t slot = 0; slot < catalog_count_; ++slot) {
+            const CatalogEntry& entry = catalog_[slot];
+            if (entry.state != CatalogState::Catalogued || !entry.handle ||
+                private_has_active_edge(slot)) {
+                continue;
+            }
+            const std::uint64_t weight = effective_retention_weight(entry);
+            if (weight < best_weight) {
+                best_weight = weight;
+                victim      = slot;
+            }
+        }
+        if (!victim) { return false; }
+        CatalogEntry& entry                 = catalog_[*victim];
+        const typename Package::ReleaseResult result =
+            program.release_continuation(std::move(*entry.handle));
+        if (result.status != ConsumeStatus::Consumed) { return false; }
+        erase_session_if_owner(entry.id);
+        clear_catalog_entry(entry);
+        saturating_increment(context_stats_.pressure_private_owners_evicted);
+        return true;
+    }
+
     [[nodiscard]] ActiveCaptureReserveResult
     reserve_active_capture(Program& program, LaneId lane, CaptureOffer&& offer,
                            std::uint32_t blocked_runnable_requests,
-                           CancellationFlagView cancellation) {
+                           CancellationFlagView cancellation, bool permit_eviction) {
         require_lane(lane, LogicalLaneState::Active);
         const bool manager_transaction = !std::holds_alternative<std::monostate>(transaction_);
         const bool program_transaction = program.has_context_transaction();
@@ -806,8 +832,28 @@ public:
 
         if (!selected) {
             if (!private_baseline.publishes_private || !private_baseline.physically_feasible) {
-                program.skip_capture(std::move(offer));
-                return ActiveCaptureReserveResult::Skipped;
+                if (permit_eviction && private_baseline.publishes_private &&
+                    try_evict_lowest_value_continuation(program)) {
+                    private_baseline =
+                        program.inspect_capture(offer, nullptr, nullptr, std::nullopt, false);
+                    if (!private_baseline.private_replacement_candidates.empty()) {
+                        private_replacement =
+                            *std::min_element(private_baseline.private_replacement_candidates.begin(),
+                                              private_baseline.private_replacement_candidates.end(),
+                                              [](CheckpointRef lhs, CheckpointRef rhs) {
+                                                  return std::tuple{lhs.kind, lhs.frontier,
+                                                                    lhs.ordinal} <
+                                                         std::tuple{rhs.kind, rhs.frontier,
+                                                                    rhs.ordinal};
+                                              });
+                        private_baseline = program.inspect_capture(
+                            offer, nullptr, nullptr, private_replacement, false);
+                    }
+                }
+                if (!private_baseline.publishes_private || !private_baseline.physically_feasible) {
+                    program.skip_capture(std::move(offer));
+                    return ActiveCaptureReserveResult::Skipped;
+                }
             }
             transaction_.template emplace<ActiveCaptureRecord>(ActiveCaptureRecord{
                 .lane              = lane,
@@ -979,32 +1025,8 @@ public:
             throw std::logic_error("Program returned an invalid terminal continuation");
         }
 
-        release_active_references(lane);
-        publication.state = CatalogState::Catalogued;
-        assign_continuation_summary(publication.summary, result.summary);
-        publication.handle.emplace(std::move(*result.continuation));
+        publish_active_continuation(lane, std::move(*result.continuation), result.summary);
         result.continuation.reset();
-        publication.session   = active.session;
-        publication.retention = active.retention;
-        migrate_observations(publication, result.summary, active.retention);
-        // A re-published continuation was just used. Record the activity directly so the
-        // retention-weight escalation sees every active turn even when the
-        // materialization-source observation path missed it. Idle continuations stop
-        // publishing and fall back to their class weight within the activity window.
-        for (CheckpointObservation& observation : publication.observations) {
-            saturating_increment(observation.observation.selected_hit_count);
-            observation.observation.last_hit_epoch = ++retention_epoch_;
-        }
-        advance_revision(publication.revision);
-        if (publication.session && active.update_session_index) {
-            if (!publish_session(*publication.session, active.publication_slot, publication.id,
-                                 publication.revision, active.publication_order)) {
-                publication.session.reset();
-                publication.retention = RetentionClass::RecentPrivate;
-            }
-        }
-        reset_active_entry(active);
-        lanes_[lane.value] = LogicalLaneState::Free;
         return result;
     }
 
@@ -1021,11 +1043,75 @@ public:
         if (result.status != ConsumeStatus::Consumed) {
             throw std::logic_error("Program did not consume aborted sequence");
         }
+        if (result.continuation) {
+            CatalogEntry& publication = catalog_.at(active_[lane.value].publication_slot);
+            if (!cache_enabled_ || publication.state != CatalogState::ReservedForActive ||
+                publication.id != active_[lane.value].continuation_id ||
+                !valid_continuation_summary(result.summary)) {
+                (void)program.release_continuation(std::move(*result.continuation));
+                result.continuation.reset();
+                release_active_references(lane);
+                clear_catalog_entry(publication);
+                reset_active_entry(active_[lane.value]);
+                lanes_[lane.value] = LogicalLaneState::Free;
+                return result;
+            }
+            publish_active_continuation(lane, std::move(*result.continuation), result.summary,
+                                        /*protect=*/true);
+            result.continuation.reset();
+            return result;
+        }
         release_active_references(lane);
         clear_catalog_entry(catalog_.at(active_[lane.value].publication_slot));
         reset_active_entry(active_[lane.value]);
         lanes_[lane.value] = LogicalLaneState::Free;
         return result;
+    }
+
+    void publish_active_continuation(
+        LaneId lane, typename Package::ContinuationHandle&& continuation,
+        const typename Package::ContinuationSummary& summary, bool protect = false) {
+        ActiveEntry& active       = active_[lane.value];
+        CatalogEntry& publication = catalog_.at(active.publication_slot);
+        release_active_references(lane);
+        publication.state = CatalogState::Catalogued;
+        assign_continuation_summary(publication.summary, summary);
+        publication.handle.emplace(std::move(continuation));
+        publication.session   = active.session;
+        publication.retention = active.retention;
+        migrate_observations(publication, summary, active.retention);
+        // A re-published continuation was just used. Record the activity directly so the
+        // retention-weight escalation sees every active turn even when the
+        // materialization-source observation path missed it. Idle continuations stop
+        // publishing and fall back to their class weight within the activity window.
+        for (CheckpointObservation& observation : publication.observations) {
+            if (protect) {
+                while (observation.observation.selected_hit_count < kActiveRetentionMinHits) {
+                    saturating_increment(observation.observation.selected_hit_count);
+                }
+            } else {
+                saturating_increment(observation.observation.selected_hit_count);
+            }
+            observation.observation.last_hit_epoch = ++retention_epoch_;
+        }
+        if (protect && publication.observations.empty()) {
+            CheckpointObservation observation;
+            for (std::uint32_t count = 0; count < kActiveRetentionMinHits; ++count) {
+                saturating_increment(observation.observation.selected_hit_count);
+            }
+            observation.observation.last_hit_epoch = ++retention_epoch_;
+            publication.observations.push_back(std::move(observation));
+        }
+        advance_revision(publication.revision);
+        if (publication.session && active.update_session_index) {
+            if (!publish_session(*publication.session, active.publication_slot, publication.id,
+                                 publication.revision, active.publication_order)) {
+                publication.session.reset();
+                publication.retention = RetentionClass::RecentPrivate;
+            }
+        }
+        reset_active_entry(active);
+        lanes_[lane.value] = LogicalLaneState::Free;
     }
 
     void apply_commit(std::span<const LaneId> lanes, const typename Package::CommitResult& result) {
