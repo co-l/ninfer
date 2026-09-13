@@ -1333,7 +1333,8 @@ struct PressurePlanningSessionImpl<NINFER_QWEN36_VARIANT> {
                              std::span<const runtime::PlanningOwnerId> preferred_owner_ids);
     [[nodiscard]] std::optional<qwen3_6::PressureTargetHandle>
     deterministic_target(runtime::PlanningCandidateId candidate,
-                         std::span<const runtime::PlanningOwnerId> preferred_owner_ids);
+                         std::span<const runtime::PlanningOwnerId> preferred_owner_ids,
+                         std::span<const std::uint32_t> preferred_owner_weights);
     [[nodiscard]] runtime::PressureTargetGuidance guidance(qwen3_6::PressureTargetHandle target);
     [[nodiscard]] qwen3_6::AssessedPressureTarget<NINFER_QWEN36_VARIANT>
     assess(qwen3_6::PressureTargetHandle target);

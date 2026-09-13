@@ -987,6 +987,14 @@ public:
         publication.session   = active.session;
         publication.retention = active.retention;
         migrate_observations(publication, result.summary, active.retention);
+        // A re-published continuation was just used. Record the activity directly so the
+        // retention-weight escalation sees every active turn even when the
+        // materialization-source observation path missed it. Idle continuations stop
+        // publishing and fall back to their class weight within the activity window.
+        for (CheckpointObservation& observation : publication.observations) {
+            saturating_increment(observation.observation.selected_hit_count);
+            observation.observation.last_hit_epoch = ++retention_epoch_;
+        }
         advance_revision(publication.revision);
         if (publication.session && active.update_session_index) {
             if (!publish_session(*publication.session, active.publication_slot, publication.id,
@@ -1438,6 +1446,31 @@ private:
         return 0;
     }
 
+    // A private continuation that was materialized within the last
+    // kActiveRetentionEpochWindow hit-epochs and has accumulated at least
+    // kActiveRetentionMinHits selections is treated as a live session (weight 16) so the
+    // planner never sheds it before idle weight; everything stale — including a
+    // never-hit context whose observations were lost — falls back to its class weight.
+    // The window covers several full session-turn cycles (each active step records
+    // activity at publication), so an actively-stepping session never flickers out.
+    // The min-hits floor keeps a once-published-then-idle re-created entry at weight 4
+    // (shed-able) instead of over-escalating it to 16 and forcing a live main to be
+    // converted when dead weight cannot be shed first.
+    static constexpr std::uint64_t kActiveRetentionEpochWindow = 32;
+    static constexpr std::uint64_t kActiveRetentionMinHits     = 3;
+
+    [[nodiscard]] std::uint32_t effective_retention_weight(const CatalogEntry& entry) const noexcept {
+        const std::uint32_t base = private_retention_weight(entry.retention);
+        if (base != private_retention_weight(RetentionClass::RecentPrivate)) { return base; }
+        if (max_hit_count(entry) < kActiveRetentionMinHits) { return base; }
+        const std::uint64_t newest = newest_hit_epoch(entry);
+        if (newest != 0 && retention_epoch_ >= newest &&
+            retention_epoch_ - newest <= kActiveRetentionEpochWindow) {
+            return private_retention_weight(RetentionClass::LiveSession);
+        }
+        return base;
+    }
+
     void require_lane(LaneId lane, LogicalLaneState expected) const {
         if (lane.value >= lane_count_ || lanes_[lane.value] != expected ||
             ((expected == LogicalLaneState::Active ||
@@ -1530,6 +1563,33 @@ private:
         return found == observations.end() ? nullptr : &found->observation;
     }
 
+    // Fallback for observations whose exact ref no longer matches: when a continuation is
+    // re-published after consuming (ConsumeToActive), the checkpoint refs' frontiers
+    // advance, so a fresh summary never matches the previous turn's observations. Carry
+    // the observation from the same checkpoint identity (kind + ordinal) with the largest
+    // frontier at or below the current one — the previous incarnation of this logical
+    // checkpoint. Without this, hit counts and recency epochs reset to zero every turn and
+    // the value ranking degenerates to pure owner order (dead weight indistinguishable
+    // from live work).
+    static const RetentionObservation*
+    find_observation_by_identity(const std::vector<CheckpointObservation>& observations,
+                                 CheckpointRef checkpoint) noexcept {
+        const RetentionObservation* best = nullptr;
+        std::uint32_t best_frontier      = 0;
+        for (const CheckpointObservation& observation : observations) {
+            if (observation.checkpoint.kind != checkpoint.kind ||
+                observation.checkpoint.ordinal != checkpoint.ordinal ||
+                observation.checkpoint.frontier > checkpoint.frontier) {
+                continue;
+            }
+            if (best == nullptr || observation.checkpoint.frontier > best_frontier) {
+                best          = &observation.observation;
+                best_frontier = observation.checkpoint.frontier;
+            }
+        }
+        return best;
+    }
+
     void migrate_observations(CatalogEntry& entry, const ContinuationSummary& summary,
                               RetentionClass retention) noexcept {
         observation_scratch_.clear();
@@ -1538,8 +1598,12 @@ private:
                 std::terminate();
             }
             RetentionObservation observation{.retention_class = retention};
-            if (const RetentionObservation* old =
-                    find_observation(entry.observations, checkpoint.ref)) {
+            const RetentionObservation* old =
+                find_observation(entry.observations, checkpoint.ref);
+            if (old == nullptr) {
+                old = find_observation_by_identity(entry.observations, checkpoint.ref);
+            }
+            if (old != nullptr) {
                 observation                 = *old;
                 observation.retention_class = retention;
             }
@@ -1640,6 +1704,14 @@ private:
             epoch = std::max(epoch, observation.observation.last_hit_epoch);
         }
         return epoch;
+    }
+
+    [[nodiscard]] std::uint64_t max_hit_count(const CatalogEntry& entry) const noexcept {
+        std::uint64_t hits = 0;
+        for (const CheckpointObservation& observation : entry.observations) {
+            hits = std::max(hits, observation.observation.selected_hit_count);
+        }
+        return hits;
     }
 
     template <class SplitCostFn>
@@ -1929,7 +2001,7 @@ private:
                     .retention_class          = entry.retention,
                     .selected_hit_count       = selected_hits,
                     .last_hit_epoch           = newest_hit_epoch(entry),
-                    .private_retention_weight = private_retention_weight(entry.retention),
+                    .private_retention_weight = effective_retention_weight(entry),
                 });
             }
             for (std::uint32_t slot = 0; slot < shared_catalog_count_; ++slot) {
@@ -2862,12 +2934,37 @@ private:
                 source.state            = CatalogState::Catalogued;
                 retained_private_source = result.status == ContextTransactionStatus::Published;
             } else if (result.source->mode == PrivateSourceMode::ConsumeToActive) {
+                // The consumed continuation's observations would otherwise be wiped with
+                // the source. Carry them into the publication entry so finish's
+                // turn-boundary migration re-attaches hit counts and recency to the
+                // advanced checkpoints by identity (kind + ordinal). Without this the
+                // value ranking never sees reuse and degenerates to owner order (idle
+                // dead weight indistinguishable from live work). When the publication
+                // reuses this slot, keep the observations in place for that migration.
+                if (record->publication_slot != capability.slot) {
+                    if (record->publication_slot < catalog_count_) {
+                        CatalogEntry& publication = catalog_[record->publication_slot];
+                        for (const CheckpointObservation& observation : source.observations) {
+                            const auto found = std::find_if(
+                                publication.observations.begin(),
+                                publication.observations.end(),
+                                [&](const CheckpointObservation& value) {
+                                    return value.checkpoint == observation.checkpoint;
+                                });
+                            if (found == publication.observations.end()) {
+                                publication.observations.push_back(observation);
+                            }
+                        }
+                    }
+                }
                 erase_session_if_owner(source.id);
                 source.handle.reset();
                 source.summary.endpoint.reset();
                 source.summary.rewrite.reset();
                 source.summary.long_anchors.clear();
-                source.observations.clear();
+                if (record->publication_slot != capability.slot) {
+                    source.observations.clear();
+                }
                 source.session.reset();
             }
         }
