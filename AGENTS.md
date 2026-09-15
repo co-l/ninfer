@@ -452,6 +452,32 @@ pool-bound, not decode-bound, so `--spec mtp` stays the serving spec.
 Revisit if VRAM headroom appears or dflash2 is measured at C=4 on a dirty
 cache.
 
+### Running an alternate artifact from the HF cache
+
+The container mounts `models/` (`ro`) and `logs/` only — an artifact kept in
+the HF cache (`~/.cache/huggingface/hub/models--…/snapshots/<rev>/`) is not
+reachable inside the container. Serve it without copying (a 23.7 GB file) by
+symlinking into `models/` **and** mounting the cache at the symlink's
+absolute target path:
+
+```bash
+# on the box: symlink the artifact's blob into models/
+ln -s /home/conrad/.cache/huggingface/hub/models--<repo>/snapshots/<rev>/<file>.ninfer \
+      /home/conrad/dev/nicefox-5090-prod/models/<file>.ninfer
+
+# launch (replicating start.sh's recipe) with an extra ro mount so the
+# symlink target resolves inside the container:
+#   -v /home/conrad/.cache/huggingface:/home/conrad/.cache/huggingface:ro
+```
+
+Example (verified 2026-09-15):
+`Yuuyuuyuuyuu/Swift-Qwen3.8-27B-OrcaRouter-NVFP4-DFlash2-ninfer` — a
+23.7 GB re-upload of the qwen3.8-27b NVFP4 artifact plus the 66 DFlash2
+companion tensors. Served with `--spec mtp --draft-tokens 4` it binds as
+`qwen3.8-27b/nvfp4` at **20.0 GiB** (the companion stays unbound under mtp —
+no VRAM penalty, full 460K pool) and is a drop-in for the deployed artifact.
+The companion only materializes under `--spec dflash2`.
+
 ### Build and deploy flow
 
 The box image is built from this repository's sources only. The box tree is a
