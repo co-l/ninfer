@@ -343,6 +343,36 @@ std::string OpenAIChatStream::content_delta(const std::string& text) {
     return chunk(identity_, Json{{"content", text}}, nullptr, include_usage_, live_timings_json());
 }
 
+std::string OpenAIChatStream::tool_call_delta(const ninfer::ToolCallStreamFragment& fragment) {
+    if (!started_ || finished_) {
+        throw std::logic_error("invalid OpenAI Chat tool delta state");
+    }
+    content_started_ = true;
+    Json delta;
+    if (fragment.kind == ninfer::ToolCallStreamFragment::Kind::Started) {
+        if (fragment.index != streamed_tool_ids_.size()) {
+            throw std::logic_error("OpenAI Chat tool call indices are not contiguous");
+        }
+        const std::string id = new_openai_chat_tool_call_id();
+        streamed_tool_ids_.push_back(id);
+        streamed_tool_names_.push_back(fragment.name);
+        delta["tool_calls"] = Json::array(
+            {Json{{"index", static_cast<int>(fragment.index)},
+                  {"id", id},
+                  {"type", "function"},
+                  {"function", Json{{"name", fragment.name}, {"arguments", ""}}}}});
+    } else if (fragment.kind == ninfer::ToolCallStreamFragment::Kind::Arguments) {
+        if (fragment.index >= streamed_tool_ids_.size()) {
+            throw std::logic_error("OpenAI Chat tool arguments preceded their call header");
+        }
+        delta["tool_calls"] = Json::array(
+            {Json{{"index", static_cast<int>(fragment.index)},
+                  {"function", Json{{"arguments", fragment.arguments}}}}});
+    }
+    if (delta.empty()) { return {}; }
+    return chunk(identity_, std::move(delta), nullptr, include_usage_, live_timings_json());
+}
+
 std::vector<std::string> OpenAIChatStream::finish(const GenerationOutcome& outcome) {
     if (!started_ || finished_) {
         throw std::logic_error("invalid OpenAI Chat stream finish state");
@@ -369,11 +399,24 @@ std::vector<std::string> OpenAIChatStream::finish(const GenerationOutcome& outco
     }
 
     if (!outcome.tool_calls.empty()) {
-        const std::vector<ToolCall> calls = materialize_tool_calls(outcome.tool_calls);
-        events.push_back(chunk(identity_, Json{{"tool_calls", tool_calls_json(calls, true)}},
-                               nullptr, include_usage_, output_timings));
+        if (streamed_tool_ids_.empty()) {
+            const std::vector<ToolCall> calls = materialize_tool_calls(outcome.tool_calls);
+            events.push_back(chunk(identity_, Json{{"tool_calls", tool_calls_json(calls, true)}},
+                                   nullptr, include_usage_, output_timings));
+        } else {
+            if (streamed_tool_ids_.size() != outcome.tool_calls.size()) {
+                throw std::logic_error("streamed tool call count does not match terminal outcome");
+            }
+            for (std::size_t index = 0; index < streamed_tool_names_.size(); ++index) {
+                if (streamed_tool_names_[index] != outcome.tool_calls[index].name) {
+                    throw std::logic_error("streamed tool call name does not match terminal outcome");
+                }
+            }
+        }
         events.push_back(chunk(identity_, Json::object(), "tool_calls", include_usage_,
                                include_usage_ ? Json(nullptr) : final_timings));
+    } else if (!streamed_tool_ids_.empty()) {
+        throw std::logic_error("streamed tool call count does not match terminal outcome");
     } else {
         events.push_back(chunk(identity_, Json::object(), finish_reason(outcome.finish_reason),
                                include_usage_, include_usage_ ? Json(nullptr) : final_timings));

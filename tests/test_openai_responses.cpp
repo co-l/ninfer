@@ -26,6 +26,14 @@ int check(bool condition, const std::string& message) {
     return 1;
 }
 
+template <typename Function>
+bool throws_logic(Function&& function) {
+    try {
+        function();
+    } catch (const std::logic_error&) { return true; }
+    return false;
+}
+
 RequestLimits limits() {
     RequestLimits value;
     value.default_max_tokens = 256;
@@ -980,6 +988,136 @@ int test_input_tokens_uses_shared_state_path() {
     return failures;
 }
 
+int test_stream_tool_deltas() {
+    OpenAIResponsesCreateRequest request = parse_openai_responses_create_request(
+        Json{{"model", "m"}, {"input", "hello"}, {"stream", true}}, limits());
+    OpenAIResponsesEventStream encoder("resp_tool_stream", 123, request, {});
+    std::vector<std::string> wire = encoder.start();
+
+    ninfer::ToolCallStreamFragment started;
+    started.index = 0;
+    started.kind  = ninfer::ToolCallStreamFragment::Kind::Started;
+    started.name  = "weather";
+    std::vector<std::string> start_events = encoder.tool_call_delta(started);
+    wire.insert(wire.end(), start_events.begin(), start_events.end());
+
+    ninfer::ToolCallStreamFragment brace;
+    brace.index     = 0;
+    brace.kind      = ninfer::ToolCallStreamFragment::Kind::Arguments;
+    brace.arguments = "{";
+    std::vector<std::string> brace_events = encoder.tool_call_delta(brace);
+    wire.insert(wire.end(), brace_events.begin(), brace_events.end());
+
+    ninfer::ToolCallStreamFragment arg;
+    arg.index     = 0;
+    arg.kind      = ninfer::ToolCallStreamFragment::Kind::Arguments;
+    arg.arguments = R"("city":"Paris")";
+    std::vector<std::string> arg_events = encoder.tool_call_delta(arg);
+    wire.insert(wire.end(), arg_events.begin(), arg_events.end());
+
+    ninfer::ToolCallStreamFragment close_brace;
+    close_brace.index     = 0;
+    close_brace.kind      = ninfer::ToolCallStreamFragment::Kind::Arguments;
+    close_brace.arguments = "}";
+    std::vector<std::string> close_events = encoder.tool_call_delta(close_brace);
+    wire.insert(wire.end(), close_events.begin(), close_events.end());
+
+    ninfer::ToolCallStreamFragment finished;
+    finished.index = 0;
+    finished.kind  = ninfer::ToolCallStreamFragment::Kind::Finished;
+    std::vector<std::string> done_events = encoder.tool_call_delta(finished);
+    wire.insert(wire.end(), done_events.begin(), done_events.end());
+
+    GenerationOutcome outcome = sample_outcome();
+    outcome.text.clear();
+    outcome.reasoning.clear();
+    outcome.tool_calls.push_back(
+        ninfer::GeneratedToolCall{.name = "weather", .arguments_json = R"({"city":"Paris"})"});
+    OpenAIResponsesStreamFinish finish = encoder.finish(outcome);
+    wire.insert(wire.end(), finish.events_before_terminal.begin(),
+                finish.events_before_terminal.end());
+    wire.push_back(encoder.terminal(finish.response));
+
+    int failures              = 0;
+    std::uint64_t sequence    = 0;
+    bool saw_added            = false;
+    bool saw_brace            = false;
+    bool saw_argument         = false;
+    std::string call_id;
+    std::string item_id;
+    std::string reconstructed;
+    bool finished_item        = false;
+    bool done_before_terminal = false;
+    for (const std::string& event : wire) {
+        const Json payload = parse_event(event);
+        failures += check(payload.at("sequence_number") == sequence++,
+                          "streamed tool SSE sequence numbers are contiguous");
+        if (payload.at("type") == "response.output_item.added" &&
+            payload.at("item").at("type") == "function_call") {
+            saw_added   = true;
+            call_id     = payload.at("item").at("call_id").get<std::string>();
+            item_id     = payload.at("item").at("id").get<std::string>();
+            failures += check(payload.at("item").at("name") == "weather" &&
+                                  payload.at("item").at("arguments") == "" &&
+                                  payload.at("item").at("status") == "in_progress",
+                              "streamed function call item opens in_progress with empty arguments");
+        } else if (payload.at("type") == "response.function_call_arguments.delta") {
+            failures += check(payload.at("item_id") == item_id,
+                              "streamed arguments delta references the opened item");
+            reconstructed += payload.at("delta").get<std::string>();
+            if (payload.at("delta").get<std::string>() == "{") { saw_brace = true; }
+            if (payload.at("delta").get<std::string>() == R"("city":"Paris")") {
+                saw_argument = true;
+            }
+        } else if (payload.at("type") == "response.function_call_arguments.done") {
+            failures += check(payload.at("arguments") == R"({"city":"Paris"})",
+                              "streamed arguments done carries the reconstructed arguments");
+        } else if (payload.at("type") == "response.output_item.done") {
+            if (payload.at("item").at("type") == "function_call") {
+                finished_item = payload.at("item").at("status") == "completed" &&
+                                payload.at("item").at("arguments") == R"({"city":"Paris"})";
+            }
+        } else if (payload.at("type") == "response.completed") {
+            done_before_terminal = true;
+        }
+    }
+    failures += check(saw_added && saw_brace && saw_argument && finished_item,
+                      "streamed Responses function-call lifecycle is incomplete");
+    failures += check(reconstructed == R"({"city":"Paris"})",
+                      "streamed arguments deltas do not reconstruct the call arguments");
+    failures += check(parse_event(wire.front()).at("type") == "response.created" &&
+                          parse_event(wire.back()).at("type") == "response.completed" &&
+                          done_before_terminal,
+                      "streamed tool stream opens and closes canonically");
+    failures += check(finish.response.body.at("output").size() == 1 &&
+                          finish.response.body.at("output")[0].at("type") == "function_call" &&
+                          finish.response.body.at("output")[0].at("call_id") == call_id &&
+                          finish.response.body.at("output")[0].at("arguments") ==
+                              R"({"city":"Paris"})",
+                      "aggregate response reuses the streamed function call ids and arguments");
+
+    OpenAIResponsesEventStream arg_first("resp_tool_arg_first", 123, request, {});
+    (void)arg_first.start();
+    failures += check(throws_logic([&] { (void)arg_first.tool_call_delta(arg); }),
+                      "streamed Responses argument rejects a fragment before its header");
+
+    OpenAIResponsesEventStream mismatch("resp_tool_mismatch", 123, request, {});
+    (void)mismatch.start();
+    ninfer::ToolCallStreamFragment other;
+    other.index = 0;
+    other.kind  = ninfer::ToolCallStreamFragment::Kind::Started;
+    other.name  = "lookup";
+    (void)mismatch.tool_call_delta(other);
+    GenerationOutcome other_outcome = sample_outcome();
+    other_outcome.text.clear();
+    other_outcome.reasoning.clear();
+    other_outcome.tool_calls.push_back(
+        ninfer::GeneratedToolCall{.name = "weather", .arguments_json = "{}"});
+    failures += check(throws_logic([&] { (void)mismatch.finish(other_outcome); }),
+                      "streamed Responses name divergence is rejected at finish");
+    return failures;
+}
+
 } // namespace
 
 int main() {
@@ -996,6 +1134,7 @@ int main() {
     failures += test_previous_response_call_graph();
     failures += test_response_object();
     failures += test_sse_sequence_and_failures();
+    failures += test_stream_tool_deltas();
     failures += test_input_tokens_uses_shared_state_path();
     if (failures == 0) { std::cout << "ok\n"; }
     return failures == 0 ? 0 : 1;

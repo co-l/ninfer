@@ -708,6 +708,10 @@ private:
             std::lock_guard lock(request->mutex);
             if (streaming && timing) { request->events.emplace_back(std::move(*timing)); }
             for (OutputDelta& delta : output) {
+                if (delta.channel == OutputChannel::ToolCall) {
+                    if (streaming) { request->events.emplace_back(std::move(delta)); }
+                    continue;
+                }
                 std::string& full = delta.channel == OutputChannel::Reasoning ? request->reasoning
                                                                               : request->content;
                 full += delta.text;

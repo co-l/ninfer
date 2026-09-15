@@ -703,6 +703,77 @@ int test_stream_response() {
     return failures;
 }
 
+int test_stream_tool_deltas() {
+    int failures = 0;
+    OpenAIChatStream stream(identity(), false);
+    (void)stream.start();
+
+    ninfer::ToolCallStreamFragment started;
+    started.index = 0;
+    started.kind  = ninfer::ToolCallStreamFragment::Kind::Started;
+    started.name  = "Edit";
+    const Json header = parse_sse(stream.tool_call_delta(started));
+    failures += check(
+        header["choices"][0]["delta"]["tool_calls"][0]["index"] == 0 &&
+            header["choices"][0]["delta"]["tool_calls"][0]["id"].get<std::string>().starts_with(
+                "call_") &&
+            header["choices"][0]["delta"]["tool_calls"][0]["function"]["name"] == "Edit" &&
+            header["choices"][0]["delta"]["tool_calls"][0]["function"]["arguments"] == "",
+        "streamed tool header emits index, owned id, name, and empty arguments");
+
+    ninfer::ToolCallStreamFragment open_brace;
+    open_brace.index     = 0;
+    open_brace.kind      = ninfer::ToolCallStreamFragment::Kind::Arguments;
+    open_brace.arguments = "{";
+    const Json brace     = parse_sse(stream.tool_call_delta(open_brace));
+    failures += check(brace["choices"][0]["delta"]["tool_calls"][0]["index"] == 0 &&
+                          brace["choices"][0]["delta"]["tool_calls"][0]["function"]["arguments"] ==
+                              "{",
+                      "streamed tool brace carries index and argument bytes");
+
+    ninfer::ToolCallStreamFragment file_arg;
+    file_arg.index     = 0;
+    file_arg.kind      = ninfer::ToolCallStreamFragment::Kind::Arguments;
+    file_arg.arguments = "\"file_path\":\"/tmp/probe.cpp\"";
+    const Json file    = parse_sse(stream.tool_call_delta(file_arg));
+    failures += check(file["choices"][0]["delta"]["tool_calls"][0]["function"]["arguments"] ==
+                          "\"file_path\":\"/tmp/probe.cpp\"",
+                      "streamed tool argument fragment carries JSON text");
+
+    GenerationOutcome outcome;
+    outcome.tool_calls.push_back(ninfer::GeneratedToolCall{
+        .name = "Edit", .arguments_json = R"({"file_path":"/tmp/probe.cpp"})"});
+    outcome.finish_reason = ninfer::FinishReason::StopToken;
+    const std::vector<std::string> events = stream.finish(outcome);
+    failures += check(events.size() == 2, "streamed tool finish emits terminal and done");
+    failures += check(parse_sse(events[0])["choices"][0]["finish_reason"] == "tool_calls" &&
+                          !parse_sse(events[0])["choices"][0]["delta"].contains("tool_calls"),
+                      "streamed tool terminal does not re-send tool calls");
+    failures += check(events.back() == "data: [DONE]\n\n", "streamed tool stream ends with DONE");
+
+    OpenAIChatStream out_of_order(identity(), false);
+    (void)out_of_order.start();
+    ninfer::ToolCallStreamFragment second_started;
+    second_started.index = 1;
+    second_started.kind  = ninfer::ToolCallStreamFragment::Kind::Started;
+    second_started.name  = "Edit";
+    failures += check(throws_logic([&] { (void)out_of_order.tool_call_delta(second_started); }),
+                      "streamed tool header rejects non-contiguous indices");
+
+    OpenAIChatStream arg_first(identity(), false);
+    (void)arg_first.start();
+    failures += check(throws_logic([&] { (void)arg_first.tool_call_delta(file_arg); }),
+                      "streamed tool argument rejects a fragment before its header");
+
+    OpenAIChatStream count_mismatch(identity(), false);
+    (void)count_mismatch.start();
+    (void)count_mismatch.tool_call_delta(started);
+    GenerationOutcome empty_outcome;
+    failures += check(throws_logic([&] { (void)count_mismatch.finish(empty_outcome); }),
+                      "streamed tool count divergence is rejected at finish");
+    return failures;
+}
+
 int test_stream_observations() {
     int failures = 0;
     OpenAIChatStream stream(identity(), true, true, true);
@@ -789,6 +860,7 @@ int main() {
     failures += test_stops_and_ranges();
     failures += test_aggregate_response();
     failures += test_stream_response();
+    failures += test_stream_tool_deltas();
     failures += test_stream_observations();
     failures += test_common_objects();
     if (failures == 0) { std::cout << "OpenAI Chat protocol tests passed\n"; }

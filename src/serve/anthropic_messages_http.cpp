@@ -175,6 +175,10 @@ void HttpServer::handle_messages(const httplib::Request& req, httplib::Response&
                     output.on_content = [&](const std::string& text) {
                         render_and_write(transport, [&] { return encoder->content_delta(text); });
                     };
+                    output.on_tool_call = [&](const ninfer::ToolCallStreamFragment& fragment) {
+                        render_and_write(transport,
+                                         [&] { return encoder->tool_call_delta(fragment); });
+                    };
                     output.is_cancelled = [&] { return transport.poll(); };
 
                     outcome = service_->run(stream->prepared, &output);

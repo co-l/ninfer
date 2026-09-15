@@ -3,6 +3,7 @@
 #include <nlohmann/json.hpp>
 
 #include <algorithm>
+#include <optional>
 #include <stdexcept>
 #include <string_view>
 #include <utility>
@@ -92,6 +93,42 @@ bool valid_function_name(std::string_view name, std::size_t max_name_length) {
     return std::all_of(name.begin(), name.end(), [](char byte) {
         return is_ascii_alphanumeric(byte) || byte == '_' || byte == '-';
     });
+}
+
+// Returns the end offset of a nested `<parameter=name>` open strictly before `limit`, when its name
+// closes with `>`. An incomplete open (no `>`) is literal value text and does not raise depth.
+std::optional<std::size_t> find_parameter_open_end(std::string_view text, std::size_t scan,
+                                                   std::size_t limit) {
+    std::size_t candidate = text.find(kParamOpen, scan);
+    while (candidate != std::string_view::npos && candidate < limit) {
+        const std::size_t name_begin = candidate + kParamOpen.size();
+        const std::size_t name_end   = text.find('>', name_begin);
+        if (name_end != std::string_view::npos && name_end < limit && name_end != name_begin) {
+            return name_end + 1;
+        }
+        candidate = text.find(kParamOpen, candidate + 1);
+    }
+    return std::nullopt;
+}
+
+// Returns the end offset of the `</parameter>` that closes the value beginning at `value_begin`,
+// accounting for balanced nested `<parameter=...>` opens. Absent when the close is incomplete.
+std::optional<std::size_t> find_parameter_close_end(std::string_view text,
+                                                    std::size_t value_begin) {
+    std::size_t depth = 1;
+    std::size_t scan  = value_begin;
+    for (;;) {
+        const std::size_t close = text.find(kParamClose, scan);
+        if (close == std::string_view::npos) { return std::nullopt; }
+        if (const auto nested_open_end = find_parameter_open_end(text, scan, close)) {
+            ++depth;
+            scan = *nested_open_end;
+            continue;
+        }
+        --depth;
+        if (depth == 0) { return close; }
+        scan = close + kParamClose.size();
+    }
 }
 
 constexpr std::uint8_t type_bit(SchemaType type) { return static_cast<std::uint8_t>(type); }
@@ -487,52 +524,12 @@ private:
         }
 
         const std::size_t value_begin = name_end + 1;
-        std::size_t value_end         = 0;
-        if (!find_parameter_close(value_begin, value_end)) {
-            return FallbackReason::MalformedStructure;
-        }
+        const auto value_end          = find_parameter_close_end(text_, value_begin);
+        if (!value_end) { return FallbackReason::MalformedStructure; }
         call.parameters.push_back(RawParameter{
-            .name = name, .value = text_.substr(value_begin, value_end - value_begin)});
-        pos = value_end + kParamClose.size();
+            .name = name, .value = text_.substr(value_begin, *value_end - value_begin)});
+        pos = *value_end + kParamClose.size();
         return FallbackReason::None;
-    }
-
-    bool find_parameter_open_before(std::size_t scan, std::size_t limit,
-                                    std::size_t& open_end) const {
-        std::size_t candidate = text_.find(kParamOpen, scan);
-        while (candidate != std::string_view::npos && candidate < limit) {
-            const std::size_t name_begin = candidate + kParamOpen.size();
-            const std::size_t name_end   = text_.find('>', name_begin);
-            if (name_end != std::string_view::npos && name_end < limit && name_end != name_begin) {
-                open_end = name_end + 1;
-                return true;
-            }
-            candidate = text_.find(kParamOpen, candidate + 1);
-        }
-        return false;
-    }
-
-    bool find_parameter_close(std::size_t value_begin, std::size_t& value_end) const {
-        std::size_t depth = 1;
-        std::size_t scan  = value_begin;
-        for (;;) {
-            const std::size_t close = text_.find(kParamClose, scan);
-            if (close == std::string_view::npos) { return false; }
-
-            std::size_t nested_open_end = 0;
-            if (find_parameter_open_before(scan, close, nested_open_end)) {
-                ++depth;
-                scan = nested_open_end;
-                continue;
-            }
-
-            --depth;
-            if (depth == 0) {
-                value_end = close;
-                return true;
-            }
-            scan = close + kParamClose.size();
-        }
     }
 
     std::string_view text_;
@@ -628,49 +625,321 @@ ToolCallOutputDecoder::ToolCallOutputDecoder(std::shared_ptr<const ToolCallOutpu
                                              std::size_t max_tool_name_length)
     : contract_(std::move(contract)), max_tool_name_length_(max_tool_name_length) {}
 
-std::string ToolCallOutputDecoder::feed(std::string_view text) {
+namespace {
+
+// One committed unit of a call under construction, emitted the moment its XML structure closes.
+void append_arguments_fragment(FeedResult& result, std::uint32_t index, std::string fragment) {
+    ToolCallStreamFragment out;
+    out.index     = index;
+    out.kind      = ToolCallStreamFragment::Kind::Arguments;
+    out.arguments = std::move(fragment);
+    result.fragments.push_back(std::move(out));
+}
+
+// A value that never closes and a region that never commits a call both become ordinary content;
+// the marker still counts as seen. A partial region after committed calls is a malformed tail.
+// RegionPhase lives on ToolCallOutputDecoder; the decoder tracks its region transitions.
+
+// True when the bytes at `pos` are a strict prefix of `token` and more bytes may still complete it.
+bool partial_token_prefix(std::string_view text, std::size_t pos, std::string_view token) {
+    const std::size_t available = text.size() - pos;
+    const std::size_t count     = std::min(available, token.size());
+    if (count == 0) { return true; }
+    if (text.substr(pos, count) != token.substr(0, count)) { return false; }
+    return count < token.size();
+}
+
+} // namespace
+
+FeedResult ToolCallOutputDecoder::feed(std::string_view text) {
     if (finished_) { throw std::logic_error("tool-call output decoder is already finished"); }
     if (text.empty()) { return {}; }
-    if (!contract_) { return std::string(text); }
-    if (saw_tool_marker_) {
-        tool_region_.append(text);
-        return {};
-    }
+    if (!contract_) { return FeedResult{.content = std::string(text)}; }
 
-    std::string visible;
-    for (std::size_t index = 0; index < text.size(); ++index) {
-        const char byte = text[index];
-        if (marker_prefix_bytes_ != 0) {
-            if (byte == kToolOpen[marker_prefix_bytes_]) {
-                ++marker_prefix_bytes_;
-                if (marker_prefix_bytes_ == kToolOpen.size()) {
-                    tool_region_ = std::move(trailing_whitespace_);
-                    trailing_whitespace_.clear();
-                    tool_region_.append(kToolOpen);
-                    tool_region_.append(text.substr(index + 1));
-                    marker_prefix_bytes_ = 0;
-                    saw_tool_marker_     = true;
-                    break;
+    FeedResult result;
+    if (phase_ == RegionPhase::Content) {
+        std::string visible;
+        for (std::size_t index = 0; index < text.size(); ++index) {
+            const char byte = text[index];
+            if (marker_prefix_bytes_ != 0) {
+                if (byte == kToolOpen[marker_prefix_bytes_]) {
+                    ++marker_prefix_bytes_;
+                    if (marker_prefix_bytes_ == kToolOpen.size()) {
+                        region_ = std::move(trailing_whitespace_);
+                        trailing_whitespace_.clear();
+                        region_.append(kToolOpen);
+                        region_.append(text.substr(index + 1));
+                        marker_prefix_bytes_  = 0;
+                        diagnostics_.marker_seen = true;
+                        phase_                = RegionPhase::ExpectToolCall;
+                        pos_                  = 0;
+                        result.content        = std::move(visible);
+                        parse_region(result);
+                        flush_region_if_failed(result);
+                        return std::move(result);
+                    }
+                    continue;
                 }
-                continue;
+                visible.append(trailing_whitespace_);
+                trailing_whitespace_.clear();
+                visible.append(kToolOpen.substr(0, marker_prefix_bytes_));
+                marker_prefix_bytes_ = 0;
             }
-            visible.append(trailing_whitespace_);
-            trailing_whitespace_.clear();
-            visible.append(kToolOpen.substr(0, marker_prefix_bytes_));
-            marker_prefix_bytes_ = 0;
-        }
 
-        if (byte == kToolOpen.front()) {
-            marker_prefix_bytes_ = 1;
-        } else if (is_format_whitespace(byte)) {
-            trailing_whitespace_.push_back(byte);
-        } else {
-            visible.append(trailing_whitespace_);
-            trailing_whitespace_.clear();
-            visible.push_back(byte);
+            if (byte == kToolOpen.front()) {
+                marker_prefix_bytes_ = 1;
+            } else if (is_format_whitespace(byte)) {
+                trailing_whitespace_.push_back(byte);
+            } else {
+                visible.append(trailing_whitespace_);
+                trailing_whitespace_.clear();
+                visible.push_back(byte);
+            }
+        }
+        result.content = std::move(visible);
+        return result;
+    }
+
+    if (phase_ == RegionPhase::ContentPassthrough) {
+        return FeedResult{.content = std::string(text)};
+    }
+    if (phase_ == RegionPhase::Discard) { return {}; }
+
+    region_.append(text);
+    parse_region(result);
+    flush_region_if_failed(result);
+    return result;
+}
+
+void ToolCallOutputDecoder::parse_region(FeedResult& result) {
+    for (;;) {
+        switch (phase_) {
+        case RegionPhase::ExpectToolCall:
+            if (!parse_expect_tool_call(result)) { return; }
+            break;
+        case RegionPhase::FunctionHeader:
+            if (!parse_function_header(result)) { return; }
+            break;
+        case RegionPhase::FunctionBody:
+            if (!parse_function_body(result)) { return; }
+            break;
+        case RegionPhase::ParameterHeader:
+            if (!parse_parameter_header(result)) { return; }
+            break;
+        case RegionPhase::ParameterValue:
+            if (!parse_parameter_value(result)) { return; }
+            break;
+        case RegionPhase::ExpectToolCallClose:
+            if (!parse_expect_tool_call_close(result)) { return; }
+            break;
+        case RegionPhase::Content:
+        case RegionPhase::ContentPassthrough:
+        case RegionPhase::Discard:
+            return;
         }
     }
-    return visible;
+}
+
+void ToolCallOutputDecoder::fail(FeedResult& result, ToolCallParseFallbackReason reason) {
+    if (failed_) { return; }
+    failed_                 = true;
+    diagnostics_.fallback_reason = reason;
+    if (!any_fragment_emitted_) {
+        pre_commit_failure_ = true;
+        phase_              = RegionPhase::ContentPassthrough;
+        return;
+    }
+    if (call_open_) {
+        call_arguments_ += "}";
+        append_arguments_fragment(result, call_index_, "}");
+        committed_.push_back(GeneratedToolCall{std::move(call_name_), std::move(call_arguments_)});
+        call_open_ = false;
+    }
+    phase_ = RegionPhase::Discard;
+}
+
+void ToolCallOutputDecoder::flush_region_if_failed(FeedResult& result) {
+    if (!pre_commit_failure_) { return; }
+    result.content += region_;
+    region_.clear();
+    pre_commit_failure_ = false;
+}
+
+bool ToolCallOutputDecoder::parse_expect_tool_call(FeedResult& result) {
+    const std::string_view region(region_);
+    std::size_t p = pos_;
+    skip_format_whitespace(region, p);
+    if (p == region.size()) {
+        pos_ = p;
+        return false;
+    }
+    if (starts_with_at(region, p, kToolOpen)) {
+        pos_   = p + kToolOpen.size();
+        phase_ = RegionPhase::FunctionHeader;
+        return true;
+    }
+    if (partial_token_prefix(region, p, kToolOpen)) { return false; }
+    fail(result, any_fragment_emitted_ ? ToolCallParseFallbackReason::TrailingContent
+                                       : ToolCallParseFallbackReason::MalformedStructure);
+    return false;
+}
+
+bool ToolCallOutputDecoder::parse_function_header(FeedResult& result) {
+    const std::string_view region(region_);
+    std::size_t p = pos_;
+    skip_format_whitespace(region, p);
+    if (p == region.size()) {
+        pos_ = p;
+        return false;
+    }
+    if (!starts_with_at(region, p, kFunctionOpen)) {
+        if (partial_token_prefix(region, p, kFunctionOpen)) { return false; }
+        fail(result, ToolCallParseFallbackReason::MalformedStructure);
+        return false;
+    }
+    const std::size_t name_begin = p + kFunctionOpen.size();
+    const std::size_t name_end   = region.find('>', name_begin);
+    if (name_end == std::string_view::npos) { return false; }
+    if (name_end == name_begin) {
+        fail(result, ToolCallParseFallbackReason::MalformedStructure);
+        return false;
+    }
+    const std::string_view name = region.substr(name_begin, name_end - name_begin);
+    if (!valid_function_name(name, max_tool_name_length_)) {
+        fail(result, ToolCallParseFallbackReason::InvalidToolName);
+        return false;
+    }
+    if (contract_->enforce_declared_names && find_tool_contract(*contract_, name) == nullptr) {
+        fail(result, ToolCallParseFallbackReason::UndeclaredTool);
+        return false;
+    }
+
+    call_name_       = std::string(name);
+    call_arguments_  = "{";
+    call_param_names_.clear();
+    call_open_       = true;
+    any_fragment_emitted_ = true;
+    {
+        ToolCallStreamFragment started;
+        started.index = call_index_;
+        started.kind  = ToolCallStreamFragment::Kind::Started;
+        started.name  = call_name_;
+        result.fragments.push_back(std::move(started));
+    }
+    append_arguments_fragment(result, call_index_, "{");
+    pos_   = name_end + 1;
+    phase_ = RegionPhase::FunctionBody;
+    return true;
+}
+
+bool ToolCallOutputDecoder::parse_function_body(FeedResult& result) {
+    const std::string_view region(region_);
+    std::size_t p = pos_;
+    skip_format_whitespace(region, p);
+    if (p == region.size()) {
+        pos_ = p;
+        return false;
+    }
+    if (starts_with_at(region, p, kFunctionClose)) {
+        call_arguments_ += "}";
+        append_arguments_fragment(result, call_index_, "}");
+        committed_.push_back(GeneratedToolCall{std::move(call_name_), std::move(call_arguments_)});
+        call_arguments_.clear();
+        call_open_ = false;
+        pos_       = p + kFunctionClose.size();
+        phase_     = RegionPhase::ExpectToolCallClose;
+        return true;
+    }
+    if (starts_with_at(region, p, kParamOpen)) {
+        pos_   = p + kParamOpen.size();
+        phase_ = RegionPhase::ParameterHeader;
+        return true;
+    }
+    if (partial_token_prefix(region, p, kFunctionClose) ||
+        partial_token_prefix(region, p, kParamOpen)) {
+        return false;
+    }
+    fail(result, ToolCallParseFallbackReason::MalformedStructure);
+    return false;
+}
+
+bool ToolCallOutputDecoder::parse_expect_tool_call_close(FeedResult& result) {
+    const std::string_view region(region_);
+    std::size_t p = pos_;
+    skip_format_whitespace(region, p);
+    if (p == region.size()) {
+        pos_ = p;
+        return false;
+    }
+    if (starts_with_at(region, p, kToolClose)) {
+        ToolCallStreamFragment finished;
+        finished.index = call_index_;
+        finished.kind  = ToolCallStreamFragment::Kind::Finished;
+        result.fragments.push_back(std::move(finished));
+        ++call_index_;
+        pos_   = p + kToolClose.size();
+        phase_ = RegionPhase::ExpectToolCall;
+        return true;
+    }
+    if (partial_token_prefix(region, p, kToolClose)) { return false; }
+    fail(result, ToolCallParseFallbackReason::MalformedStructure);
+    return false;
+}
+
+bool ToolCallOutputDecoder::parse_parameter_header(FeedResult& result) {
+    const std::string_view region(region_);
+    const std::size_t name_end = region.find('>', pos_);
+    if (name_end == std::string_view::npos) { return false; }
+    if (name_end == pos_) {
+        fail(result, ToolCallParseFallbackReason::MalformedStructure);
+        return false;
+    }
+    const std::string_view name = region.substr(pos_, name_end - pos_);
+    if (std::find(call_param_names_.begin(), call_param_names_.end(), name) !=
+        call_param_names_.end()) {
+        fail(result, ToolCallParseFallbackReason::DuplicateParameter);
+        return false;
+    }
+    param_name_ = std::string(name);
+    call_param_names_.push_back(param_name_);
+    pos_   = name_end + 1;
+    phase_ = RegionPhase::ParameterValue;
+    return true;
+}
+
+bool ToolCallOutputDecoder::parse_parameter_value(FeedResult& result) {
+    const std::string_view region(region_);
+    const auto value_end = find_parameter_close_end(region, pos_);
+    if (!value_end) { return false; }
+    const std::string_view value = region.substr(pos_, *value_end - pos_);
+
+    const Contract::Tool* tool = find_tool_contract(*contract_, call_name_);
+    if (tool != nullptr && !tool->unambiguous) { tool = nullptr; }
+    const Contract::Parameter* parameter =
+        tool == nullptr ? nullptr : find_parameter_contract(*tool, param_name_);
+    NormalizedParameter normalized = normalize_parameter(value, parameter);
+    if (tool != nullptr && parameter == nullptr) {
+        normalized.disposition = ParameterNormalization::SchemaMismatch;
+    }
+    if (normalized.disposition == ParameterNormalization::Omitted) {
+        ++diagnostics_.empty_arguments_omitted;
+    } else if (normalized.disposition == ParameterNormalization::SchemaMismatch) {
+        ++diagnostics_.schema_mismatch_arguments;
+    }
+
+    if (normalized.disposition != ParameterNormalization::Omitted) {
+        const bool first = call_arguments_ == "{";
+        std::string fragment;
+        if (!first) { fragment.push_back(','); }
+        fragment += encode_json_string(param_name_);
+        fragment.push_back(':');
+        fragment += normalized.json_value;
+        call_arguments_ += fragment;
+        append_arguments_fragment(result, call_index_, std::move(fragment));
+    }
+    pos_   = *value_end + kParamClose.size();
+    phase_ = RegionPhase::FunctionBody;
+    return true;
 }
 
 ToolCallOutputDecoder::Terminal ToolCallOutputDecoder::finish() {
@@ -678,24 +947,53 @@ ToolCallOutputDecoder::Terminal ToolCallOutputDecoder::finish() {
     finished_ = true;
     if (!contract_) { return {}; }
 
-    ParsedToolCallOutput parsed =
-        parse_qwen_tool_call_output(tool_region_, max_tool_name_length_, *contract_);
-    if (saw_tool_marker_ && parsed.is_tool_call_response) {
-        trailing_whitespace_.clear();
-        tool_region_.clear();
-        marker_prefix_bytes_ = 0;
-        return Terminal{.content     = {},
-                        .tool_calls  = std::move(parsed.tool_calls),
-                        .diagnostics = parsed.diagnostics};
+    if (phase_ == RegionPhase::Content) {
+        std::string tail = std::move(trailing_whitespace_);
+        tail.append(kToolOpen.substr(0, marker_prefix_bytes_));
+        return Terminal{.content = std::move(tail), .diagnostics = diagnostics_};
+    }
+    if (phase_ == RegionPhase::ContentPassthrough) {
+        diagnostics_.marker_seen = true;
+        return Terminal{.content = std::move(region_), .diagnostics = diagnostics_};
+    }
+    if (phase_ == RegionPhase::Discard) {
+        return Terminal{.content = {}, .tool_calls = std::move(committed_),
+                        .diagnostics = diagnostics_};
     }
 
-    std::string tail = std::move(trailing_whitespace_);
-    tail.append(kToolOpen.substr(0, marker_prefix_bytes_));
-    marker_prefix_bytes_ = 0;
-    tail += tool_region_;
-    tool_region_.clear();
-    return Terminal{
-        .content = std::move(tail), .tool_calls = {}, .diagnostics = parsed.diagnostics};
+    // Still inside the region at terminal: the committed fragments stand, the incomplete tail is
+    // reported as a fallback, and an open call is closed from its committed arguments.
+    diagnostics_.marker_seen = true;
+    if (!any_fragment_emitted_) {
+        diagnostics_.fallback_reason = ToolCallParseFallbackReason::MalformedStructure;
+        return Terminal{.content = std::move(region_), .diagnostics = diagnostics_};
+    }
+    std::optional<ToolCallStreamFragment> closing_fragment;
+    if (call_open_) {
+        call_arguments_ += "}";
+        ToolCallStreamFragment closing;
+        closing.index     = call_index_;
+        closing.kind      = ToolCallStreamFragment::Kind::Arguments;
+        closing.arguments = "}";
+        closing_fragment  = std::move(closing);
+        committed_.push_back(GeneratedToolCall{std::move(call_name_), std::move(call_arguments_)});
+        call_open_ = false;
+    }
+    if (phase_ == RegionPhase::ExpectToolCall) {
+        const std::string_view region(region_);
+        std::size_t p = pos_;
+        skip_format_whitespace(region, p);
+        if (p < region.size()) {
+            diagnostics_.fallback_reason = ToolCallParseFallbackReason::TrailingContent;
+        }
+    } else {
+        diagnostics_.fallback_reason = ToolCallParseFallbackReason::MalformedStructure;
+    }
+    diagnostics_.structured_call_count = static_cast<std::uint32_t>(committed_.size());
+    std::vector<ToolCallStreamFragment> terminal_fragments;
+    if (closing_fragment) { terminal_fragments.push_back(std::move(*closing_fragment)); }
+    return Terminal{.content = {}, .tool_calls = std::move(committed_),
+                    .diagnostics = diagnostics_, .fragments = std::move(terminal_fragments)};
 }
 
 } // namespace ninfer::models::qwen3_5::frontend

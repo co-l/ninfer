@@ -54,6 +54,7 @@ public:
     void note_timing(const ninfer::GenerationTimingObservation& timing);
     std::string reasoning_delta(const std::string& text);
     std::string content_delta(const std::string& text);
+    std::string tool_call_delta(const ninfer::ToolCallStreamFragment& fragment);
     std::vector<std::string> finish(const GenerationOutcome& outcome);
 
 private:
@@ -62,6 +63,8 @@ private:
     OpenAIChatResponseIdentity identity_;
     std::string reasoning_;
     std::string content_;
+    std::vector<std::string> streamed_tool_ids_;
+    std::vector<std::string> streamed_tool_names_;
     std::optional<ninfer::GenerationTimingObservation> live_timing_;
     std::uint32_t prompt_tokens_            = 0;
     std::uint32_t cached_tokens_            = 0;

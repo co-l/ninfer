@@ -419,6 +419,10 @@ void HttpServer::handle_responses(const httplib::Request& req, httplib::Response
                         render_and_write(transport,
                                          [&] { return stream->encoder->content_delta(text); });
                     };
+                    output.on_tool_call = [&](const ninfer::ToolCallStreamFragment& fragment) {
+                        render_and_write(transport,
+                                         [&] { return stream->encoder->tool_call_delta(fragment); });
+                    };
                     output.is_cancelled = [&] { return transport.poll(); };
 
                     outcome = service_->run(stream->prepared, &output);

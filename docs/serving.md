@@ -172,7 +172,18 @@ properties, perform recursive JSON Schema validation, or use constrained decodin
 String parameters preserve function/tool-call markers and balanced nested
 `<parameter=...>...</parameter>` text as value bytes. The Qwen wire format has no delimiter escape,
 so an unmatched nested parameter opener or a standalone `</parameter>` cannot be represented
-unambiguously; either causes the complete tool-call region to fall back to ordinary content.
+unambiguously; either causes the tool-call region to fall back to ordinary content when nothing has
+been streamed yet, or the affected call to be closed from its committed fragments once the call
+header has already streamed.
+
+Streaming tool calls commit incrementally: the function name is emitted the moment
+`<function=name>` closes, the opening `{` follows immediately, then one argument fragment per
+completed `<parameter=...>...</parameter>` block, then `}` at `</function>`, and the call closes at
+`</tool_call>`. Concatenating the argument fragments of a call reproduces exactly its aggregate
+`arguments_json`. Before the first fragment, a malformed start still falls back to ordinary text
+without losing bytes; after a fragment, committed calls stand and an incomplete tail is closed from
+the committed fragments and reported in `request_done.result.tool_call_parse`. Non-streaming and
+aggregate responses keep the strict all-or-nothing parse.
 
 Messages enter the selected template in their input order. The maintained Qwen templates keep
 system/developer messages at their original positions.
@@ -222,11 +233,14 @@ options override server defaults set with `--no-thinking` and `--preserve-thinki
 thinking, effort and preservation options use the template's defaults.
 
 Streaming begins with an assistant-role chunk, sends separate reasoning and content deltas, then a
-finish-reason chunk and `[DONE]`. When `stream_options.include_usage` is true, a final empty
-`choices` chunk contains completed usage. Aggregate and streamed usage include cached prompt tokens
-and reasoning-token details; choices carry `logprobs: null` when log probabilities were not
-requested, and aggregate assistant messages carry `refusal: null` because refusal output is not
-supported.
+finish-reason chunk and `[DONE]`. With tools enabled, tool calls stream incrementally: the call
+header (index, owned `call_` id, and function name) is sent the moment the model closes the
+`<function=name>` tag, then one `tool_calls` delta per committed argument fragment, then a
+finish-reason `tool_calls` chunk without re-sending the calls. When `stream_options.include_usage`
+is true, a final empty `choices` chunk contains completed usage. Aggregate and streamed usage
+include cached prompt tokens and reasoning-token details; choices carry `logprobs: null` when log
+probabilities were not requested, and aggregate assistant messages carry `refusal: null` because
+refusal output is not supported.
 
 ### llama.cpp-compatible request observations
 
@@ -571,9 +585,14 @@ The normal lifecycle is:
 
 Function arguments use `response.function_call_arguments.delta` and `.done`. IDs, output indices,
 and content indices remain stable, and concatenated deltas equal the terminal Item. Responses SSE
-does not emit the Chat Completions `[DONE]` sentinel. With tools enabled, ordinary answer text still
-streams immediately; only an ambiguous `<tool_call>` suffix or the structured tool region is held.
-Malformed tool markup is flushed back as ordinary text without losing bytes.
+does not emit the Chat Completions `[DONE]` sentinel. With tools enabled, ordinary answer text and
+reasoning still stream immediately; tool calls stream incrementally — `response.output_item.added`
+carries the function name the moment the model closes `<function=name>`, followed by one
+`response.function_call_arguments.delta` per committed argument fragment, then
+`function_call_arguments.done` and `output_item.done` when the call closes. Malformed markup before
+any tool fragment is committed is flushed back as ordinary text without losing bytes; once a tool
+call has been streamed, committed calls stand and a structurally incomplete tail is closed from the
+committed fragments and reported in `request_done.result.tool_call_parse`.
 
 ### Local response state and resources
 
@@ -862,7 +881,10 @@ unspecified. `enable_thinking` records whether the response starts in thinking m
 call count, empty non-string arguments omitted during normalization, schema-mismatched arguments
 preserved for consumer validation, and a stable text-fallback reason. Fallback reasons are `none`,
 `malformed_structure`, `duplicate_parameter`, `invalid_tool_name`, `undeclared_tool`, and
-`trailing_content`. These counters contain no tool arguments or generated text.
+`trailing_content`. In streaming responses, the fallback reason applies only to the region before
+any tool fragment was committed (still restored verbatim as content); a malformed tail after
+committed calls is closed from the committed fragments and the committed call count stands. These
+counters contain no tool arguments or generated text.
 
 `request_done.timings_seconds` contains `prepare`, `ttft`, `vision`, `prefill`, `decode`, and `total`
 as full-precision JSON numbers. Its `speculative` object contains `backend`, `draft_window`, `rounds`,

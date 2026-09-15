@@ -370,27 +370,16 @@ public:
 };
 
 PublishedOutput::PublishedOutput(PublishedOutput&& other) noexcept
-    : values_(std::move(other.values_)), size_(std::exchange(other.size_, 0)) {}
+    : values_(std::move(other.values_)) {}
 
 PublishedOutput& PublishedOutput::operator=(PublishedOutput&& other) noexcept {
-    if (this != &other) {
-        values_ = std::move(other.values_);
-        size_   = std::exchange(other.size_, 0);
-    }
+    if (this != &other) { values_ = std::move(other.values_); }
     return *this;
 }
 
-void PublishedOutput::clear() noexcept {
-    for (std::size_t index = 0; index < size_; ++index) { values_[index] = {}; }
-    size_ = 0;
-}
+void PublishedOutput::clear() noexcept { values_.clear(); }
 
-void PublishedOutput::push_back(OutputDelta value) {
-    if (size_ == values_.size()) {
-        throw std::logic_error("output decoder produced more than two channel transitions");
-    }
-    values_[size_++] = std::move(value);
-}
+void PublishedOutput::push_back(OutputDelta value) { values_.push_back(std::move(value)); }
 
 OutputSession::OutputSession() noexcept                           = default;
 OutputSession::~OutputSession()                                   = default;
@@ -630,15 +619,32 @@ PublishedOutput OutputSession::commit_preview() {
     impl_->preview_output.clear();
     impl_->preview_ready = false;
 
+    std::vector<ToolCallStreamFragment> tool_fragments;
     for (OutputDelta& delta : output) {
         if (delta.channel == OutputChannel::Content) {
-            delta.text = impl_->tool_call_output.feed(delta.text);
+            fi::FeedResult fed = impl_->tool_call_output.feed(delta.text);
+            delta.text                                = std::move(fed.content);
+            for (ToolCallStreamFragment& fragment : fed.fragments) {
+                tool_fragments.push_back(std::move(fragment));
+            }
         }
+    }
+    for (ToolCallStreamFragment& fragment : tool_fragments) {
+        OutputDelta tool_delta;
+        tool_delta.channel    = OutputChannel::ToolCall;
+        tool_delta.tool_call  = std::move(fragment);
+        output.push_back(std::move(tool_delta));
     }
     if (impl_->state.terminal) {
         fi::ToolCallOutputDecoder::Terminal terminal = impl_->tool_call_output.finish();
         impl_->tool_calls                            = std::move(terminal.tool_calls);
         impl_->tool_call_parse                       = terminal.diagnostics;
+        for (ToolCallStreamFragment& fragment : terminal.fragments) {
+            OutputDelta tool_delta;
+            tool_delta.channel    = OutputChannel::ToolCall;
+            tool_delta.tool_call  = std::move(fragment);
+            output.push_back(std::move(tool_delta));
+        }
         if (!terminal.content.empty()) {
             OutputDelta* content = nullptr;
             for (OutputDelta& delta : output) {

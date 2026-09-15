@@ -64,6 +64,7 @@ struct StreamSink {
     std::function<void(const ninfer::GenerationTimingObservation& timing)> on_timing;
     std::function<void(const std::string& delta_text)> on_content;
     std::function<void(const std::string& delta_text)> on_reasoning;
+    std::function<void(const ninfer::ToolCallStreamFragment& fragment)> on_tool_call;
     std::function<bool()> is_cancelled;
 };
 

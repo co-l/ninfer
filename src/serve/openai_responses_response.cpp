@@ -335,6 +335,9 @@ public:
     std::string reasoning_text;
     std::string content_text;
     ItemIds ids;
+    std::vector<std::string> function_names;
+    std::vector<std::string> function_arguments;
+    std::vector<int> function_output_indices;
 };
 
 OpenAIResponsesEventStream::OpenAIResponsesEventStream(std::string response_id,
@@ -393,6 +396,74 @@ std::vector<std::string> OpenAIResponsesEventStream::content_delta(const std::st
     return events;
 }
 
+std::vector<std::string>
+OpenAIResponsesEventStream::tool_call_delta(const ninfer::ToolCallStreamFragment& fragment) {
+    if (!impl_->started || impl_->finish_built) {
+        throw std::logic_error("invalid Responses tool delta event state");
+    }
+    std::vector<std::string> events_;
+    auto append = [&](std::vector<std::string> events) {
+        events_.insert(events_.end(), std::make_move_iterator(events.begin()),
+                       std::make_move_iterator(events.end()));
+    };
+    if (fragment.kind == ninfer::ToolCallStreamFragment::Kind::Started) {
+        if (fragment.index != impl_->ids.function_calls.size()) {
+            throw std::logic_error("Responses tool call indices are not contiguous");
+        }
+        append(impl_->close_reasoning(impl_->reasoning_text));
+        const std::string item_id = new_openai_response_item_id("fc");
+        const std::string call_id = new_openai_response_item_id("call");
+        impl_->ids.function_calls.push_back(item_id);
+        impl_->ids.call_ids.push_back(call_id);
+        impl_->function_names.push_back(fragment.name);
+        impl_->function_arguments.push_back("");
+        const int output_index = impl_->next_output_index++;
+        impl_->function_output_indices.push_back(output_index);
+        Json added_item = {{"id", item_id},
+                           {"type", "function_call"},
+                           {"status", "in_progress"},
+                           {"call_id", call_id},
+                           {"arguments", ""}};
+        add_wire_function_identity(added_item, impl_->request, fragment.name);
+        events_.push_back(sse(impl_->event(
+            "response.output_item.added",
+            Json{{"output_index", output_index}, {"item", added_item}})));
+        return events_;
+    }
+    if (fragment.index >= impl_->ids.function_calls.size()) {
+        throw std::logic_error("Responses tool fragment preceded its call header");
+    }
+    const std::string& item_id     = impl_->ids.function_calls[fragment.index];
+    const std::string& call_id     = impl_->ids.call_ids[fragment.index];
+    const std::string& name        = impl_->function_names[fragment.index];
+    const int output_index         = impl_->function_output_indices[fragment.index];
+    if (fragment.kind == ninfer::ToolCallStreamFragment::Kind::Arguments) {
+        impl_->function_arguments[fragment.index] += fragment.arguments;
+        events_.push_back(sse(impl_->event(
+            "response.function_call_arguments.delta", Json{{"item_id", item_id},
+                                                           {"output_index", output_index},
+                                                           {"delta", fragment.arguments}})));
+        return events_;
+    }
+    const std::string& arguments = impl_->function_arguments[fragment.index];
+    Json arguments_done          = {{"item_id", item_id},
+                                    {"output_index", output_index},
+                                    {"arguments", arguments}};
+    add_wire_function_identity(arguments_done, impl_->request, name);
+    events_.push_back(
+        sse(impl_->event("response.function_call_arguments.done", std::move(arguments_done))));
+    Json done_item = {{"id", item_id},
+                      {"type", "function_call"},
+                      {"status", "completed"},
+                      {"call_id", call_id},
+                      {"arguments", arguments}};
+    add_wire_function_identity(done_item, impl_->request, name);
+    events_.push_back(
+        sse(impl_->event("response.output_item.done",
+                         Json{{"output_index", output_index}, {"item", done_item}})));
+    return events_;
+}
+
 OpenAIResponsesStreamFinish OpenAIResponsesEventStream::finish(const GenerationOutcome& outcome) {
     if (!impl_->started || impl_->finish_built) {
         throw std::logic_error("invalid Responses stream finish state");
@@ -440,44 +511,53 @@ OpenAIResponsesStreamFinish OpenAIResponsesEventStream::finish(const GenerationO
         append(impl_->close_message(outcome.text, item_status));
     }
 
-    impl_->ids.function_calls.reserve(outcome.tool_calls.size());
-    impl_->ids.call_ids.reserve(outcome.tool_calls.size());
-    for (const ninfer::GeneratedToolCall& call : outcome.tool_calls) {
-        const std::string item_id = new_openai_response_item_id("fc");
-        const std::string call_id = new_openai_response_item_id("call");
-        impl_->ids.function_calls.push_back(item_id);
-        impl_->ids.call_ids.push_back(call_id);
-        const int output_index = impl_->next_output_index++;
-        Json added_item        = {{"id", item_id},
-                                  {"type", "function_call"},
-                                  {"status", "in_progress"},
-                                  {"call_id", call_id},
-                                  {"arguments", ""}};
-        add_wire_function_identity(added_item, impl_->request, call.name);
-        finished.events_before_terminal.push_back(
-            sse(impl_->event("response.output_item.added",
-                             Json{{"output_index", output_index}, {"item", added_item}})));
-        if (!call.arguments_json.empty()) {
+    if (impl_->ids.function_calls.empty()) {
+        for (const ninfer::GeneratedToolCall& call : outcome.tool_calls) {
+            const std::string item_id = new_openai_response_item_id("fc");
+            const std::string call_id = new_openai_response_item_id("call");
+            impl_->ids.function_calls.push_back(item_id);
+            impl_->ids.call_ids.push_back(call_id);
+            const int output_index = impl_->next_output_index++;
+            Json added_item        = {{"id", item_id},
+                                      {"type", "function_call"},
+                                      {"status", "in_progress"},
+                                      {"call_id", call_id},
+                                      {"arguments", ""}};
+            add_wire_function_identity(added_item, impl_->request, call.name);
+            finished.events_before_terminal.push_back(
+                sse(impl_->event("response.output_item.added",
+                                 Json{{"output_index", output_index}, {"item", added_item}})));
+            if (!call.arguments_json.empty()) {
+                finished.events_before_terminal.push_back(sse(impl_->event(
+                    "response.function_call_arguments.delta", Json{{"item_id", item_id},
+                                                                   {"output_index", output_index},
+                                                                   {"delta", call.arguments_json}})));
+            }
+            Json arguments_done = {{"item_id", item_id},
+                                   {"output_index", output_index},
+                                   {"arguments", call.arguments_json}};
+            add_wire_function_identity(arguments_done, impl_->request, call.name);
+            finished.events_before_terminal.push_back(sse(
+                impl_->event("response.function_call_arguments.done", std::move(arguments_done))));
+            Json done_item = {{"id", item_id},
+                              {"type", "function_call"},
+                              {"status", "completed"},
+                              {"call_id", call_id},
+                              {"arguments", call.arguments_json}};
+            add_wire_function_identity(done_item, impl_->request, call.name);
             finished.events_before_terminal.push_back(sse(impl_->event(
-                "response.function_call_arguments.delta", Json{{"item_id", item_id},
-                                                               {"output_index", output_index},
-                                                               {"delta", call.arguments_json}})));
+                "response.output_item.done",
+                Json{{"output_index", output_index}, {"item", done_item}})));
         }
-        Json arguments_done = {{"item_id", item_id},
-                               {"output_index", output_index},
-                               {"arguments", call.arguments_json}};
-        add_wire_function_identity(arguments_done, impl_->request, call.name);
-        finished.events_before_terminal.push_back(
-            sse(impl_->event("response.function_call_arguments.done", std::move(arguments_done))));
-        Json done_item = {{"id", item_id},
-                          {"type", "function_call"},
-                          {"status", "completed"},
-                          {"call_id", call_id},
-                          {"arguments", call.arguments_json}};
-        add_wire_function_identity(done_item, impl_->request, call.name);
-        finished.events_before_terminal.push_back(
-            sse(impl_->event("response.output_item.done",
-                             Json{{"output_index", output_index}, {"item", done_item}})));
+    } else {
+        if (impl_->ids.function_calls.size() != outcome.tool_calls.size()) {
+            throw std::logic_error("streamed tool call count does not match terminal outcome");
+        }
+        for (std::size_t index = 0; index < impl_->function_names.size(); ++index) {
+            if (impl_->function_names[index] != outcome.tool_calls[index].name) {
+                throw std::logic_error("streamed tool call name does not match terminal outcome");
+            }
+        }
     }
 
     finished.response = build_response(impl_->id, impl_->created_at, impl_->request, impl_->runtime,

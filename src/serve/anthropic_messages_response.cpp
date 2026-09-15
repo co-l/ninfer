@@ -311,6 +311,50 @@ std::vector<std::string> AnthropicMessagesStream::close_text() {
         event("content_block_stop", Json{{"type", "content_block_stop"}, {"index", text_index_}})};
 }
 
+std::vector<std::string> AnthropicMessagesStream::tool_call_delta(
+    const ninfer::ToolCallStreamFragment& fragment) {
+    if (!started_ || finished_) { throw std::logic_error("invalid Anthropic tool delta state"); }
+    std::vector<std::string> events;
+    if (fragment.kind == ninfer::ToolCallStreamFragment::Kind::Started) {
+        if (fragment.index != tool_use_ids_.size()) {
+            throw std::logic_error("Anthropic tool call indices are not contiguous");
+        }
+        append(events, close_thinking());
+        append(events, close_text());
+        const std::string id = random_identifier("toolu_");
+        tool_use_ids_.push_back(id);
+        tool_use_names_.push_back(fragment.name);
+        tool_use_arguments_.push_back("");
+        const int index = next_index_++;
+        tool_use_indices_.push_back(index);
+        events.push_back(event(
+            "content_block_start", Json{{"type", "content_block_start"},
+                                        {"index", index},
+                                        {"content_block", Json{{"type", "tool_use"},
+                                                               {"id", id},
+                                                               {"name", fragment.name},
+                                                               {"input", Json::object()}}}}));
+        return events;
+    }
+    if (fragment.index >= tool_use_ids_.size()) {
+        throw std::logic_error("Anthropic tool fragment preceded its call header");
+    }
+    const std::string& id   = tool_use_ids_[fragment.index];
+    const int index         = tool_use_indices_[fragment.index];
+    if (fragment.kind == ninfer::ToolCallStreamFragment::Kind::Arguments) {
+        tool_use_arguments_[fragment.index] += fragment.arguments;
+        events.push_back(event("content_block_delta",
+                               Json{{"type", "content_block_delta"},
+                                    {"index", index},
+                                    {"delta", Json{{"type", "input_json_delta"},
+                                                   {"partial_json", fragment.arguments}}}}));
+        return events;
+    }
+    events.push_back(
+        event("content_block_stop", Json{{"type", "content_block_stop"}, {"index", index}}));
+    return events;
+}
+
 std::vector<std::string> AnthropicMessagesStream::finish(const GenerationOutcome& outcome) {
     if (!started_ || finished_) { throw std::logic_error("invalid Anthropic stream finish state"); }
     require_prefix(outcome.reasoning, reasoning_, "reasoning");
@@ -329,23 +373,34 @@ std::vector<std::string> AnthropicMessagesStream::finish(const GenerationOutcome
     append(events, close_thinking());
     append(events, close_text());
 
-    for (const ToolCall& call : materialize_tool_calls(outcome)) {
-        (void)parse_tool_input(call);
-        const int index = next_index_++;
-        events.push_back(
-            event("content_block_start", Json{{"type", "content_block_start"},
-                                              {"index", index},
-                                              {"content_block", Json{{"type", "tool_use"},
-                                                                     {"id", call.id},
-                                                                     {"name", call.name},
-                                                                     {"input", Json::object()}}}}));
-        events.push_back(event("content_block_delta",
-                               Json{{"type", "content_block_delta"},
-                                    {"index", index},
-                                    {"delta", Json{{"type", "input_json_delta"},
-                                                   {"partial_json", call.arguments_json}}}}));
-        events.push_back(
-            event("content_block_stop", Json{{"type", "content_block_stop"}, {"index", index}}));
+    if (tool_use_ids_.empty()) {
+        for (const ToolCall& call : materialize_tool_calls(outcome)) {
+            (void)parse_tool_input(call);
+            const int index = next_index_++;
+            events.push_back(
+                event("content_block_start", Json{{"type", "content_block_start"},
+                                                  {"index", index},
+                                                  {"content_block", Json{{"type", "tool_use"},
+                                                                         {"id", call.id},
+                                                                         {"name", call.name},
+                                                                         {"input", Json::object()}}}}));
+            events.push_back(event("content_block_delta",
+                                   Json{{"type", "content_block_delta"},
+                                        {"index", index},
+                                        {"delta", Json{{"type", "input_json_delta"},
+                                                       {"partial_json", call.arguments_json}}}}));
+            events.push_back(event("content_block_stop",
+                                   Json{{"type", "content_block_stop"}, {"index", index}}));
+        }
+    } else {
+        if (tool_use_ids_.size() != outcome.tool_calls.size()) {
+            throw std::logic_error("streamed tool call count does not match terminal outcome");
+        }
+        for (std::size_t index = 0; index < tool_use_names_.size(); ++index) {
+            if (tool_use_names_[index] != outcome.tool_calls[index].name) {
+                throw std::logic_error("streamed tool call name does not match terminal outcome");
+            }
+        }
     }
 
     const StopPresentation stop = stop_presentation(outcome);

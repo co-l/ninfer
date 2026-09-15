@@ -63,6 +63,7 @@ public:
 
     std::vector<std::string> reasoning_delta(const std::string& text);
     std::vector<std::string> content_delta(const std::string& text);
+    std::vector<std::string> tool_call_delta(const ninfer::ToolCallStreamFragment& fragment);
     std::vector<std::string> finish(const GenerationOutcome& outcome);
     std::string error(const ApiError& api_error) const;
 
@@ -74,6 +75,10 @@ private:
     AnthropicResponseIdentity identity_;
     std::string reasoning_;
     std::string content_;
+    std::vector<std::string> tool_use_ids_;
+    std::vector<std::string> tool_use_names_;
+    std::vector<std::string> tool_use_arguments_;
+    std::vector<int> tool_use_indices_;
     int input_tokens_   = 0;
     int next_index_     = 0;
     int thinking_index_ = -1;

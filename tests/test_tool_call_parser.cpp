@@ -443,8 +443,8 @@ int test_empty_declared_non_string_is_omitted() {
     bool every_split_matches = true;
     for (std::size_t split = 0; split <= text.size(); ++split) {
         fi::ToolCallOutputDecoder decoder(contract, 128);
-        std::string visible = decoder.feed(std::string_view(text).substr(0, split));
-        visible += decoder.feed(std::string_view(text).substr(split));
+        std::string visible = decoder.feed(std::string_view(text).substr(0, split)).content;
+        visible += decoder.feed(std::string_view(text).substr(split)).content;
         auto terminal = decoder.finish();
         if (visible != "I need one more check." || !terminal.content.empty() ||
             terminal.tool_calls.size() != 1 ||
@@ -460,7 +460,9 @@ int test_empty_declared_non_string_is_omitted() {
 
     fi::ToolCallOutputDecoder bytewise(contract, 128);
     std::string bytewise_visible;
-    for (const char byte : text) { bytewise_visible += bytewise.feed(std::string_view(&byte, 1)); }
+    for (const char byte : text) {
+        bytewise_visible += bytewise.feed(std::string_view(&byte, 1)).content;
+    }
     auto bytewise_terminal = bytewise.finish();
     failures +=
         check(bytewise_visible == "I need one more check." && bytewise_terminal.content.empty() &&
@@ -645,9 +647,9 @@ int test_all_or_nothing_structural_commit() {
 int test_incremental_valid_and_boolean() {
     fi::ToolCallOutputDecoder legacy(std::make_shared<fi::ToolCallOutputContract>(), 64);
     std::string visible;
-    visible += legacy.feed("Calling weather.  \n<tool_");
-    visible += legacy.feed("call>\n<function=get_weather>");
-    visible += legacy.feed("\n</function>\n</tool_call>");
+    visible += legacy.feed("Calling weather.  \n<tool_").content;
+    visible += legacy.feed("call>\n<function=get_weather>").content;
+    visible += legacy.feed("\n</function>\n</tool_call>").content;
     auto legacy_terminal = legacy.finish();
     visible += legacy_terminal.content;
 
@@ -655,9 +657,9 @@ int test_incremental_valid_and_boolean() {
         output_contract_for("configure", Json{{"enabled", Json{{"type", "boolean"}}}});
     fi::ToolCallOutputDecoder boolean(std::move(bool_contract), 64);
     std::string boolean_visible;
-    boolean_visible += boolean.feed("<tool_call>\n<function=configure>\n<parameter=enabled>\nT");
-    boolean_visible += boolean.feed("r");
-    boolean_visible += boolean.feed("ue\n</parameter>\n</function>\n</tool_call>");
+    boolean_visible += boolean.feed("<tool_call>\n<function=configure>\n<parameter=enabled>\nT").content;
+    boolean_visible += boolean.feed("r").content;
+    boolean_visible += boolean.feed("ue\n</parameter>\n</function>\n</tool_call>").content;
     auto boolean_terminal = boolean.finish();
 
     int failures = 0;
@@ -675,24 +677,24 @@ int test_incremental_valid_and_boolean() {
 }
 
 int test_incremental_fallback_preserves_bytes() {
-    const std::string original = "prefix  \n<tool_call>\n<function=broken>";
+    const std::string original = "prefix  \n<tool_call>\n<function=broken";
     fi::ToolCallOutputDecoder malformed(std::make_shared<fi::ToolCallOutputContract>(), 64);
     std::string restored;
-    restored += malformed.feed(original.substr(0, 10));
-    restored += malformed.feed(original.substr(10));
+    restored += malformed.feed(original.substr(0, 10)).content;
+    restored += malformed.feed(original.substr(10)).content;
     auto malformed_terminal = malformed.finish();
     restored += malformed_terminal.content;
 
     fi::ToolCallOutputDecoder ordinary(std::make_shared<fi::ToolCallOutputContract>(), 64);
     std::string ordinary_text;
-    ordinary_text += ordinary.feed("ordinary text  ");
+    ordinary_text += ordinary.feed("ordinary text  ").content;
     ordinary_text += ordinary.finish().content;
 
     const std::string partial_original = "  <tool_x then <tool_";
     fi::ToolCallOutputDecoder partial(std::make_shared<fi::ToolCallOutputContract>(), 64);
     std::string partial_restored;
-    partial_restored += partial.feed("  <too");
-    partial_restored += partial.feed("l_x then <tool_");
+    partial_restored += partial.feed("  <too").content;
+    partial_restored += partial.feed("l_x then <tool_").content;
     partial_restored += partial.finish().content;
 
     int failures = 0;
@@ -707,6 +709,36 @@ int test_incremental_fallback_preserves_bytes() {
     return failures;
 }
 
+int test_incremental_header_commit_finalizes() {
+    const std::string original = "prefix  \n<tool_call>\n<function=broken>";
+    fi::ToolCallOutputDecoder decoder(std::make_shared<fi::ToolCallOutputContract>(), 64);
+    std::string content;
+    content += decoder.feed(original.substr(0, 10)).content;
+    auto feed = decoder.feed(original.substr(10));
+    content += feed.content;
+    auto terminal = decoder.finish();
+    content += terminal.content;
+
+    int failures = 0;
+    failures += check(content == "prefix",
+                      "committed header leaked raw markup into content");
+    failures += check(terminal.tool_calls.size() == 1 &&
+                          terminal.tool_calls.front().name == "broken" &&
+                          terminal.tool_calls.front().arguments_json == "{}",
+                      "committed header was not finalized as an empty-argument call");
+    failures += check(terminal.diagnostics.marker_seen &&
+                          terminal.diagnostics.fallback_reason ==
+                              ninfer::ToolCallParseFallbackReason::MalformedStructure,
+                      "committed header lost fallback diagnostics");
+    failures += check(feed.fragments.size() == 2 &&
+                          feed.fragments[0].kind == ninfer::ToolCallStreamFragment::Kind::Started &&
+                          feed.fragments[0].name == "broken" &&
+                          feed.fragments[1].kind == ninfer::ToolCallStreamFragment::Kind::Arguments &&
+                          feed.fragments[1].arguments == "{",
+                      "committed header did not stream its start and opening brace");
+    return failures;
+}
+
 int test_incremental_embedded_parameter_markup() {
     auto contract = output_contract_for("bash", Json{{"command", Json{{"type", "string"}}}});
     const std::string command = "pattern='<parameter=inner>value</parameter>'\n"
@@ -717,7 +749,7 @@ int test_incremental_embedded_parameter_markup() {
     std::string visible;
     constexpr std::size_t kChunk = 7;
     for (std::size_t offset = 0; offset < text.size(); offset += kChunk) {
-        visible += decoder.feed(std::string_view(text).substr(offset, kChunk));
+        visible += decoder.feed(std::string_view(text).substr(offset, kChunk)).content;
     }
     auto terminal = decoder.finish();
 
@@ -730,6 +762,267 @@ int test_incremental_embedded_parameter_markup() {
         failures += check(args.at("command") == command,
                           "chunked embedded parameter markup changed string bytes");
     }
+    return failures;
+}
+
+std::string collect_arguments(const std::vector<ninfer::ToolCallStreamFragment>& fragments) {
+    std::string joined;
+    for (const ninfer::ToolCallStreamFragment& fragment : fragments) {
+        if (fragment.kind == ninfer::ToolCallStreamFragment::Kind::Arguments) {
+            joined += fragment.arguments;
+        }
+    }
+    return joined;
+}
+
+int test_incremental_fragment_stream_single_call() {
+    const std::string text = "Calling weather.\n" +
+                             tool_call("get_weather", {{"city", "Paris"}, {"days", "2"}});
+    const auto contract =
+        contract_for("get_weather", Json{{"city", Json{{"type", "string"}}},
+                                         {"days", Json{{"type", "integer"}}}});
+    fi::ToolCallOutputDecoder decoder(
+        std::make_shared<const fi::ToolCallOutputContract>(contract), 64);
+    std::string content;
+    std::vector<ninfer::ToolCallStreamFragment> fragments;
+    for (const char byte : text) {
+        fi::FeedResult fed = decoder.feed(std::string_view(&byte, 1));
+        content += fed.content;
+        for (auto& fragment : fed.fragments) { fragments.push_back(std::move(fragment)); }
+    }
+    auto terminal = decoder.finish();
+    content += terminal.content;
+    for (auto& fragment : terminal.fragments) { fragments.push_back(std::move(fragment)); }
+
+    int failures = 0;
+    failures += check(content == "Calling weather.", "single-call content prefix changed");
+    failures += check(fragments.size() == 6, "single-call fragment count changed");
+    if (fragments.size() == 6) {
+        failures += check(fragments[0].kind == ninfer::ToolCallStreamFragment::Kind::Started &&
+                              fragments[0].index == 0 && fragments[0].name == "get_weather",
+                          "single-call start fragment changed");
+        failures += check(fragments[1].kind == ninfer::ToolCallStreamFragment::Kind::Arguments &&
+                              fragments[1].arguments == "{",
+                          "single-call opening brace fragment changed");
+        failures += check(fragments[2].kind == ninfer::ToolCallStreamFragment::Kind::Arguments &&
+                              fragments[2].arguments == "\"city\":\"Paris\"",
+                          "single-call string argument fragment changed");
+        failures += check(fragments[3].kind == ninfer::ToolCallStreamFragment::Kind::Arguments &&
+                              fragments[3].arguments == ",\"days\":2",
+                          "single-call integer argument fragment changed");
+        failures += check(fragments[4].kind == ninfer::ToolCallStreamFragment::Kind::Arguments &&
+                              fragments[4].arguments == "}",
+                          "single-call closing brace fragment changed");
+        failures += check(fragments[5].kind == ninfer::ToolCallStreamFragment::Kind::Finished &&
+                              fragments[5].index == 0,
+                          "single-call finish fragment changed");
+    }
+    const std::string joined = collect_arguments(fragments);
+    failures += check(terminal.tool_calls.size() == 1 &&
+                          terminal.tool_calls.front().arguments_json == joined &&
+                          terminal.tool_calls.front().arguments_json ==
+                              "{\"city\":\"Paris\",\"days\":2}",
+                      "single-call streamed arguments do not match terminal arguments");
+    const auto batch = fi::parse_qwen_tool_call_output(text, 64, contract);
+    failures += check(batch.is_tool_call_response && batch.tool_calls.size() == 1 &&
+                          batch.tool_calls.front().arguments_json == joined,
+                      "single-call streamed arguments do not match the batch parse");
+    return failures;
+}
+
+int test_incremental_fragment_stream_multiple_calls() {
+    const std::string text = tool_call("first", {{"payload", "{\"ok\":true,\"items\":[1,2]}"}}) +
+                             "\n" + tool_call("second", {{"value", "plain text"}});
+    fi::ToolCallOutputDecoder decoder(std::make_shared<fi::ToolCallOutputContract>(), 64);
+    std::vector<ninfer::ToolCallStreamFragment> fragments;
+    for (const char byte : text) {
+        fi::FeedResult fed = decoder.feed(std::string_view(&byte, 1));
+        for (auto& fragment : fed.fragments) { fragments.push_back(std::move(fragment)); }
+    }
+    auto terminal = decoder.finish();
+    for (auto& fragment : terminal.fragments) { fragments.push_back(std::move(fragment)); }
+
+    int failures = 0;
+    std::uint32_t started = 0;
+    std::uint32_t finished = 0;
+    for (const ninfer::ToolCallStreamFragment& fragment : fragments) {
+        if (fragment.kind == ninfer::ToolCallStreamFragment::Kind::Started) {
+            failures += check(fragment.index == started, "multiple-call start index changed");
+            ++started;
+        } else if (fragment.kind == ninfer::ToolCallStreamFragment::Kind::Finished) {
+            failures += check(fragment.index == finished, "multiple-call finish index changed");
+            ++finished;
+        }
+    }
+    failures += check(started == 2 && finished == 2, "multiple-call fragment counts changed");
+    failures += check(terminal.tool_calls.size() == 2,
+                      "multiple-call terminal call count changed");
+    if (terminal.tool_calls.size() == 2) {
+        const Json first  = Json::parse(terminal.tool_calls[0].arguments_json);
+        const Json second = Json::parse(terminal.tool_calls[1].arguments_json);
+        failures += check(first.at("payload").at("ok") == true &&
+                              first.at("payload").at("items").at(1) == 2,
+                          "multiple-call first arguments changed");
+        failures += check(second.at("value") == "plain text",
+                          "multiple-call second arguments changed");
+    }
+    return failures;
+}
+
+int test_incremental_post_commit_tail() {
+    const auto contract =
+        contract_for("configure", Json{{"flag", Json{{"type", "boolean"}}}});
+    const std::string text = tool_call("configure", {{"flag", "true"}}) +
+                             "\n<tool_call>\n<function=configure>\n<parameter=flag>\nfalse\n";
+    fi::ToolCallOutputDecoder decoder(
+        std::make_shared<const fi::ToolCallOutputContract>(contract), 64);
+    std::vector<ninfer::ToolCallStreamFragment> fragments;
+    for (const char byte : text) {
+        fi::FeedResult fed = decoder.feed(std::string_view(&byte, 1));
+        for (auto& fragment : fed.fragments) { fragments.push_back(std::move(fragment)); }
+    }
+    auto terminal = decoder.finish();
+    for (auto& fragment : terminal.fragments) { fragments.push_back(std::move(fragment)); }
+
+    int failures = 0;
+    failures += check(terminal.tool_calls.size() == 2,
+                      "post-commit malformed tail did not finalize both calls");
+    if (terminal.tool_calls.size() == 2) {
+        const Json first = Json::parse(terminal.tool_calls[0].arguments_json);
+        failures += check(first.at("flag") == true, "post-commit first call arguments changed");
+        failures += check(terminal.tool_calls[1].arguments_json == "{}",
+                          "post-commit open call did not finalize from committed fragments");
+    }
+    failures +=
+        check(terminal.diagnostics.fallback_reason ==
+                  ninfer::ToolCallParseFallbackReason::MalformedStructure,
+              "post-commit malformed tail lost its fallback reason");
+    failures +=
+        check(!collect_arguments(fragments).empty() &&
+                  collect_arguments(fragments) ==
+                      terminal.tool_calls[0].arguments_json + "{}",
+              "post-commit streamed arguments do not concatenate to the finalized calls");
+    return failures;
+}
+
+int test_incremental_trailing_content() {
+    const std::string text = tool_call("configure", {{"flag", "true"}}) + "\nextra answer";
+    const auto contract =
+        contract_for("configure", Json{{"flag", Json{{"type", "boolean"}}}});
+    fi::ToolCallOutputDecoder decoder(
+        std::make_shared<const fi::ToolCallOutputContract>(contract), 64);
+    std::string content;
+    for (const char byte : text) {
+        fi::FeedResult fed = decoder.feed(std::string_view(&byte, 1));
+        content += fed.content;
+    }
+    auto terminal = decoder.finish();
+    content += terminal.content;
+
+    int failures = 0;
+    failures += check(content.empty(), "trailing garbage leaked into content");
+    failures += check(terminal.tool_calls.size() == 1,
+                      "trailing garbage dropped the committed call");
+    if (terminal.tool_calls.size() == 1) {
+        const Json args = Json::parse(terminal.tool_calls.front().arguments_json);
+        failures += check(args.at("flag") == true, "trailing garbage changed the committed call");
+    }
+    failures += check(terminal.diagnostics.fallback_reason ==
+                          ninfer::ToolCallParseFallbackReason::TrailingContent,
+                      "trailing garbage lost its fallback reason");
+    return failures;
+}
+
+int test_incremental_concat_matches_batch() {
+    const auto contract = contract_for(
+        "Edit",
+        Json{{"file_path", Json{{"type", "string"}}},
+             {"replace_all", Json{{"type", "boolean"}}},
+             {"count", Json{{"type", "integer"}}}});
+    const std::string text =
+        "<tool_call>\n<function=Edit>\n"
+        "<parameter=file_path>\n/tmp/probe.cpp\n</parameter>\n"
+        "<parameter=replace_all>\n</parameter>\n"
+        "<parameter=count>\n7.5\n</parameter>\n"
+        "</function>\n</tool_call>";
+    fi::ToolCallOutputDecoder decoder(
+        std::make_shared<const fi::ToolCallOutputContract>(contract), 64);
+    std::vector<ninfer::ToolCallStreamFragment> fragments;
+    for (const char byte : text) {
+        fi::FeedResult fed = decoder.feed(std::string_view(&byte, 1));
+        for (auto& fragment : fed.fragments) { fragments.push_back(std::move(fragment)); }
+    }
+    auto terminal = decoder.finish();
+    for (auto& fragment : terminal.fragments) { fragments.push_back(std::move(fragment)); }
+
+    const std::string joined = collect_arguments(fragments);
+    const auto batch         = fi::parse_qwen_tool_call_output(text, 64, contract);
+
+    int failures = 0;
+    failures += check(batch.is_tool_call_response && batch.tool_calls.size() == 1,
+                      "batch reference rejected the Edit call");
+    failures += check(terminal.tool_calls.size() == 1,
+                      "incremental Edit call was not committed");
+    if (batch.is_tool_call_response && batch.tool_calls.size() == 1 &&
+        terminal.tool_calls.size() == 1) {
+        failures += check(joined == batch.tool_calls.front().arguments_json &&
+                              terminal.tool_calls.front().arguments_json == joined,
+                          "incremental arguments diverge from the batch parse");
+    }
+    failures += check(terminal.diagnostics.empty_arguments_omitted ==
+                          batch.diagnostics.empty_arguments_omitted,
+                      "incremental empty-argument omission diverged from the batch parse");
+    failures += check(terminal.diagnostics.schema_mismatch_arguments ==
+                          batch.diagnostics.schema_mismatch_arguments,
+                      "incremental schema-mismatch counters diverged from the batch parse");
+    return failures;
+}
+
+int test_incremental_fragments_split_invariant() {
+    const auto contract = contract_for(
+        "configure",
+        Json{{"flag", Json{{"type", "boolean"}}},
+             {"count", Json{{"type", "integer"}}}});
+    const std::string text =
+        tool_call("configure", {{"flag", "TRUE"}, {"count", "7"}}) + "\n" +
+        tool_call("configure", {{"count", "0"}});
+
+    const auto reference = [&](std::size_t split) {
+        fi::ToolCallOutputDecoder decoder(
+            std::make_shared<const fi::ToolCallOutputContract>(contract), 64);
+        std::string content;
+        std::vector<ninfer::ToolCallStreamFragment> fragments;
+        const auto feed_all = [&](std::string_view chunk) {
+            fi::FeedResult fed = decoder.feed(chunk);
+            content += fed.content;
+            for (auto& fragment : fed.fragments) { fragments.push_back(std::move(fragment)); }
+        };
+        feed_all(std::string_view(text).substr(0, split));
+        feed_all(std::string_view(text).substr(split));
+        auto terminal = decoder.finish();
+        content += terminal.content;
+        for (auto& fragment : terminal.fragments) { fragments.push_back(std::move(fragment)); }
+        return std::make_tuple(std::move(content), std::move(fragments),
+                               std::move(terminal.tool_calls), terminal.diagnostics);
+    };
+
+    const auto [content_0, fragments_0, calls_0, diagnostics_0] = reference(0);
+    int failures = 0;
+    for (std::size_t split = 0; split <= text.size(); ++split) {
+        const auto [content, fragments, calls, diagnostics] = reference(split);
+        failures += check(content == content_0, "split boundary changed visible content");
+        failures += check(fragments == fragments_0,
+                          "split boundary changed the committed fragment sequence");
+        failures += check(calls == calls_0, "split boundary changed terminal tool calls");
+        failures += check(diagnostics == diagnostics_0,
+                          "split boundary changed terminal diagnostics");
+    }
+    failures += check(fragments_0.size() == 11,
+                      "two-call fragment stream has an unexpected size");
+    failures += check(calls_0.size() == 2 &&
+                          calls_0[0].arguments_json == "{\"flag\":true,\"count\":7}" &&
+                          calls_0[1].arguments_json == "{\"count\":0}",
+                      "two-call terminal arguments changed");
     return failures;
 }
 
@@ -755,7 +1048,14 @@ int main() {
     failures += test_all_or_nothing_structural_commit();
     failures += test_incremental_valid_and_boolean();
     failures += test_incremental_fallback_preserves_bytes();
+    failures += test_incremental_header_commit_finalizes();
     failures += test_incremental_embedded_parameter_markup();
+    failures += test_incremental_fragment_stream_single_call();
+    failures += test_incremental_fragment_stream_multiple_calls();
+    failures += test_incremental_post_commit_tail();
+    failures += test_incremental_trailing_content();
+    failures += test_incremental_concat_matches_batch();
+    failures += test_incremental_fragments_split_invariant();
     if (failures == 0) { std::cout << "ok\n"; }
     return failures == 0 ? 0 : 1;
 }

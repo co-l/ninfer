@@ -26,6 +26,14 @@ int check(bool condition, const std::string& message) {
     return 1;
 }
 
+template <typename Function>
+bool throws_logic(Function&& function) {
+    try {
+        function();
+    } catch (const std::logic_error&) { return true; }
+    return false;
+}
+
 Json base_request() {
     return Json{{"model", "claude-local"},
                 {"messages", Json::array({Json{{"role", "user"}, {"content", "hello"}}})},
@@ -767,6 +775,102 @@ int test_stream() {
     return failures;
 }
 
+int test_stream_tool_deltas() {
+    const AnthropicResponseIdentity identity =
+        make_anthropic_response_identity("req_stream_tool", "claude-local");
+    AnthropicMessagesStream stream(identity, 100);
+    std::vector<std::string> events{stream.start()};
+
+    ninfer::ToolCallStreamFragment started;
+    started.index = 0;
+    started.kind  = ninfer::ToolCallStreamFragment::Kind::Started;
+    started.name  = "Edit";
+    std::vector<std::string> start_events = stream.tool_call_delta(started);
+    events.insert(events.end(), std::make_move_iterator(start_events.begin()),
+                  std::make_move_iterator(start_events.end()));
+
+    ninfer::ToolCallStreamFragment brace;
+    brace.index     = 0;
+    brace.kind      = ninfer::ToolCallStreamFragment::Kind::Arguments;
+    brace.arguments = "{";
+    std::vector<std::string> brace_events = stream.tool_call_delta(brace);
+    events.insert(events.end(), std::make_move_iterator(brace_events.begin()),
+                  std::make_move_iterator(brace_events.end()));
+
+    ninfer::ToolCallStreamFragment arg;
+    arg.index     = 0;
+    arg.kind      = ninfer::ToolCallStreamFragment::Kind::Arguments;
+    arg.arguments = R"("file_path":"/tmp/probe.cpp")";
+    std::vector<std::string> arg_events = stream.tool_call_delta(arg);
+    events.insert(events.end(), std::make_move_iterator(arg_events.begin()),
+                  std::make_move_iterator(arg_events.end()));
+
+    ninfer::ToolCallStreamFragment finished;
+    finished.index = 0;
+    finished.kind  = ninfer::ToolCallStreamFragment::Kind::Finished;
+    std::vector<std::string> done_events = stream.tool_call_delta(finished);
+    events.insert(events.end(), std::make_move_iterator(done_events.begin()),
+                  std::make_move_iterator(done_events.end()));
+
+    GenerationOutcome outcome;
+    outcome.tool_calls.push_back(ninfer::GeneratedToolCall{
+        .name = "Edit", .arguments_json = R"({"file_path":"/tmp/probe.cpp"})"});
+    outcome.finish_reason = ninfer::FinishReason::StopToken;
+    std::vector<std::string> terminal = stream.finish(outcome);
+    events.insert(events.end(), std::make_move_iterator(terminal.begin()),
+                  std::make_move_iterator(terminal.end()));
+
+    int failures = 0;
+    bool saw_edit_start = false;
+    bool saw_brace      = false;
+    bool saw_argument   = false;
+    bool saw_block_stop = false;
+    int tool_blocks     = 0;
+    for (const std::string& wire : events) {
+        const Json event = parse_event(wire);
+        if (event.at("type") == "content_block_start" &&
+            event.at("content_block").at("type") == "tool_use") {
+            ++tool_blocks;
+            saw_edit_start = event.at("content_block").at("name") == "Edit" &&
+                             event.at("content_block").at("input").empty();
+        } else if (event.at("type") == "content_block_delta" &&
+                   event.at("delta").at("type") == "input_json_delta") {
+            const std::string partial = event.at("delta").at("partial_json").get<std::string>();
+            if (partial == "{") { saw_brace = true; }
+            if (partial == R"("file_path":"/tmp/probe.cpp")") { saw_argument = true; }
+        } else if (event.at("type") == "content_block_stop") {
+            saw_block_stop = true;
+        } else if (event.at("type") == "message_delta") {
+            failures += check(event.at("delta").at("stop_reason") == "tool_use",
+                              "streamed Anthropic tool terminal stop reason is tool_use");
+        }
+    }
+    failures += check(tool_blocks == 1 && saw_edit_start && saw_brace && saw_argument &&
+                          saw_block_stop,
+                      "streamed Anthropic tool block lifecycle is incomplete");
+    failures += check(events.back().find("\"message_stop\"") != std::string::npos,
+                      "streamed Anthropic tool stream ends with message_stop");
+
+    AnthropicMessagesStream mismatch(identity, 100);
+    (void)mismatch.start();
+    ninfer::ToolCallStreamFragment named;
+    named.index = 0;
+    named.kind  = ninfer::ToolCallStreamFragment::Kind::Started;
+    named.name  = "Other";
+    (void)mismatch.tool_call_delta(named);
+    GenerationOutcome other_outcome;
+    other_outcome.tool_calls.push_back(ninfer::GeneratedToolCall{
+        .name = "Edit", .arguments_json = "{}"});
+    failures += check(throws_logic([&] { (void)mismatch.finish(other_outcome); }),
+                      "streamed Anthropic tool name divergence is rejected at finish");
+
+    AnthropicMessagesStream arg_first(identity, 100);
+    (void)arg_first.start();
+    failures += check(throws_logic([&] { (void)arg_first.tool_call_delta(brace); }),
+                      "streamed Anthropic tool argument rejects a fragment before its header");
+    return failures;
+}
+
 } // namespace
 
 int main() {
@@ -783,6 +887,7 @@ int main() {
     failures += test_aggregate_and_errors();
     failures += test_tool_call_presentation();
     failures += test_stream();
+    failures += test_stream_tool_deltas();
     if (failures != 0) {
         std::cerr << failures << " Anthropic adapter checks failed\n";
         return 1;

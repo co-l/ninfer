@@ -223,6 +223,7 @@ struct ResolvedSamplingParameters {
 enum class OutputChannel : std::uint8_t {
     Content,
     Reasoning,
+    ToolCall,
 };
 
 struct StopString {
@@ -294,6 +295,29 @@ struct ToolCall {
 struct GeneratedToolCall {
     std::string name;
     std::string arguments_json;
+
+    [[nodiscard]] friend bool
+    operator==(const GeneratedToolCall&, const GeneratedToolCall&) noexcept = default;
+};
+
+// One incrementally committed unit of a model-origin Qwen XML tool call, published to streaming
+// consumers as the region is generated. `index` is the stable zero-based call ordinal; fragments
+// for one call arrive in order Started, Arguments..., Finished. Concatenating the Arguments
+// fragments of a call reproduces exactly the arguments JSON of its terminal GeneratedToolCall.
+struct ToolCallStreamFragment {
+    enum class Kind : std::uint8_t {
+        Started,    // function name committed; `name` holds the complete name
+        Arguments,  // `arguments` holds a JSON text fragment appended to the call arguments
+        Finished,   // call closed; carries no payload
+    };
+
+    std::uint32_t index = 0;
+    Kind kind           = Kind::Started;
+    std::string name;
+    std::string arguments;
+
+    [[nodiscard]] friend bool
+    operator==(const ToolCallStreamFragment&, const ToolCallStreamFragment&) noexcept = default;
 };
 
 // Terminal interpretation of model-origin tool-call markup. Parameter schemas guide JSON
@@ -565,6 +589,7 @@ enum class FinishReason : std::uint8_t {
 struct OutputDelta {
     OutputChannel channel = OutputChannel::Content;
     std::string text;
+    ToolCallStreamFragment tool_call;
 };
 
 // Exact prompt accounting selected at admission. Streaming consumers receive this once before any
