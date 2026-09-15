@@ -2,6 +2,7 @@
 
 #include "runtime/engine/context_cost.h"
 #include "runtime/engine/context_portfolio_value.h"
+#include "runtime/engine/materialization_budget.h"
 #include "runtime/engine/resource_search.h"
 
 #include <algorithm>
@@ -99,7 +100,7 @@ public:
          const ContextMachineCostModel& machine_cost, std::span<const CandidateInput> candidates,
          std::uint32_t root_candidate_index, PressureInputsFn&& pressure_inputs,
          LogicalGoalFn&& logical_goal, FinalScheduleFn&& final_schedule,
-         Clock::time_point planning_started) {
+         Clock::time_point planning_started, PlanningAllowance allowance = {}) {
         if (candidates.empty() || root_candidate_index >= candidates.size()) {
             throw std::invalid_argument("materialization planning problem has no root candidate");
         }
@@ -400,13 +401,14 @@ public:
     plan(Program& program, const PreparedPrompt& prompt,
          const ContextMachineCostModel& machine_cost, std::span<const CandidateInput> candidates,
          std::uint32_t root_candidate_index, PressureInputsFn&& pressure_inputs,
-         LogicalGoalFn&& logical_goal, Clock::time_point planning_started) {
+         LogicalGoalFn&& logical_goal, Clock::time_point planning_started,
+         PlanningAllowance allowance = {}) {
         const auto no_optional_schedule = [](PlanningCandidateId, const RequestPlanSummary&,
                                              const auto&) { return std::vector<std::uint32_t>{}; };
         return plan(program, prompt, machine_cost, candidates, root_candidate_index,
                     std::forward<PressureInputsFn>(pressure_inputs),
                     std::forward<LogicalGoalFn>(logical_goal), no_optional_schedule,
-                    planning_started);
+                    planning_started, allowance);
     }
 
 private:
