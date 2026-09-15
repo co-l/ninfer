@@ -86,4 +86,3 @@ echo
 echo "deploy complete: $BOX:$REMOTE_DIR built $IMAGE"
 echo "next:"
 echo "  ./start.sh    # serve (stops vLLM/SGLang, starts ninfer)"
-echo "  # then the cache-pressure bench suite from the workstation"
