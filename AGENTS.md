@@ -232,7 +232,7 @@ Hygiene (results are only comparable when these hold):
 |---|---|
 | hardware | RTX 5090 (32 GiB), 30 GiB RAM; box must be ON — wake with `../5090/poweron-gaming-pc.sh` (WoL + 400 W cap) |
 | source tree | `/home/conrad/dev/nicefox-5090-prod` (plain tree, **not** a git repo; a clean copy of this repository — git-tracked files only, deployed by `./deploy.sh` — plus the box-local `models/` + `logs/`; the cache-fix planner work is committed on the `nicefox` remote, no patch files) |
-| artifact | `models/qwen3_8_27b_nvfp4.ninfer` (21.5 GiB, Qwen3.8-27B NVFP4) |
+| artifact | `models/qwen3_8_27b_nvfp4.ninfer` (21.5 GB / 20.0 GiB, Qwen3.8-27B NVFP4; sha256 `bb336052…`, = HF `3b84117`) |
 | image | `localhost/ninfer:local` (Dockerfile: CUDA 13.1.2-devel/Ubuntu 24.04, `podman build --jobs 4` with ninja parallelism via `BUILD_PARALLEL`, default 16; measured: compile peaks at ~7 GiB RAM and takes ~4 min — CPU-bound, not RAM-bound) |
 | container | `ninfer-serve` via `./start.sh` (launch) / `./stop.sh` (stop) in this repo (rootful podman, GPU 0, ports 8000, mounts `models/` ro + `logs/`); env overrides `NINFER_CONCURRENCY` (4), `NINFER_KV_CAPACITY` (460000), `NINFER_KV_DTYPE` (nvfp4), `NINFER_DEVICE_STATE_SLOTS` (4), `NINFER_VISION` (1) |
 | request log | `/home/conrad/dev/nicefox-5090-prod/logs/requests.jsonl` |
@@ -248,6 +248,23 @@ device pool (hard limit ≈ 469K at C=4), 96 host state slots and 12 GiB host
 KV are mandatory for finalize survival, `--max-private-continuations 128` is
 required by the 65×8K retention set, and no container memory limit is set on
 purpose (the pinned state+KV footprint needs the whole box).
+
+### DFlash2 (upstream) — deliberately not adopted
+
+Upstream `master` (Neroued/ninfer) has a `--spec dflash2` backend for
+`qwen3.8-27b` (integration `385b30ce`: five-layer draft backbone, top-16
+conditional selector, K=1..15). The box artifact is byte-identical to the
+original `neroued/Qwen3.8-27B-nvfp4-NInfer` release (HF commit `3b84117`,
+sha256 `bb336052…`); the current HF file (v2, `552c374c…`) adds 66 DFlash2
+companion tensors from `z-lab/Qwen3.8-27B-DFlash2` @ `50307d4c`
+(+2,226,801,152 B). Not adopted here: on this VRAM-saturated box the
+companion costs ≈121K tokens (≈26%) of the 460K-token NVFP4-G16 device
+pool (18,432 B/token) plus separate proposal/verify workspace extents, for
+a measured +19.5% single-request corpus decode at C=1 only (37% acceptance,
+cross-campaign upstream numbers, no C=4 point). This deployment is
+pool-bound, not decode-bound, so `--spec mtp` stays the serving spec.
+Revisit if VRAM headroom appears or dflash2 is measured at C=4 on a dirty
+cache.
 
 ### Build and deploy flow
 
