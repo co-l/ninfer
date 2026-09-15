@@ -1304,6 +1304,25 @@ PressurePlanningSessionImpl::deterministic_target(
                          if (left_epoch != right_epoch) { return left_epoch < right_epoch; }
                          return victim_size(left) < victim_size(right);
                      });
+    // Live-vs-dead split for the Host-placement fix-up below. The retention-weight
+    // escalation (RecentPrivate -> LiveSession) only engages once an owner accumulates
+    // enough recorded hits, which does not happen for these workloads (the hit
+    // recording misses the private-endpoint reuse path), so the weight cannot be
+    // trusted to protect active sessions. Recency can: an actively-stepping session's
+    // epoch advances every turn, a long-idle retained context's is frozen, so a victim
+    // whose last hit sits within the activity window of the freshest owner is live
+    // (demote, never evict) and everything older is dead retained weight (shed first).
+    // Mirrors the resource-manager activity window that the weight escalation uses.
+    constexpr std::uint64_t kPlannerActivityWindow = 32;
+    std::uint64_t freshest_epoch                   = 0;
+    for (std::size_t index = 0; index < options.victims.size(); ++index) {
+        freshest_epoch = std::max(freshest_epoch, victim_epochs[index]);
+    }
+    const auto victim_live = [&](std::size_t victim_index) {
+        const std::uint64_t epoch = victim_epochs[victim_index];
+        if (epoch == 0) { return true; } // never hit: freshly admitted, protect
+        return freshest_epoch >= epoch && freshest_epoch - epoch <= kPlannerActivityWindow;
+    };
 
     // Phase 1 — device waterfall: while the device is over-committed, demote the
     // lowest-value victims whose retained (non-evicting, no-new-checkpoint-drop)
@@ -1424,13 +1443,17 @@ PressurePlanningSessionImpl::deterministic_target(
     // Phase 3 — evict: last resort. While still infeasible, evict the smallest
     // victims first (eviction order) whose eviction strictly reduces the total
     // over-commitment. Both tiers are full and everything retainable has been
-    // retained at this point.
+    // retained at this point. Live victims are skipped: their overflow is demoted
+    // (or shed) by Phase 4's host-placement fix-up, which can spend the Host that
+    // these dead-weight evictions free; evicting a session here would destroy a
+    // prefix a demote could have preserved.
     for (std::size_t step = 0; step < maximum_steps; ++step) {
         const detail::PhysicalResources residual =
             projected_residual(choice_scratch, std::nullopt, nullptr);
         if (feasible(residual)) { break; }
         std::optional<Selection> selected;
         for (const std::size_t victim_index : eviction_order) {
+            if (victim_live(victim_index)) { continue; }
             const CandidateVictimOptions& victim = options.victims[victim_index];
             if (victim.eviction_choice == 0 || victim.eviction_choice > victim.decisions.size()) {
                 continue;
@@ -1540,18 +1563,75 @@ PressurePlanningSessionImpl::deterministic_target(
             std::fprintf(stderr, "[PP] P4 allocator_rejects_demotes\n");
             for (std::size_t step = 0; step < maximum_steps; ++step) {
                 if (compose_accepts()) { break; }
-                // First make room for the demotes by evicting undecided dead weight
-                // (weight < 16 — never a live session). At a finalize squeeze the host
-                // arena is fragmented by the shared subs' KV — the mains' demote cannot
-                // be placed even though bytes are free. Evicting a sub frees device
-                // (fewer demotes needed) and its Host extents. Live (weight 16)
-                // undecided victims are excluded here: they are the last resort and are
-                // only shed when no demote could absorb the shortfall, so a finalize
-                // never destroys an active session's main while a dead demote could
-                // have been converted instead.
+                // Host-placement fix-up. Two complementary actions free what the plan
+                // still needs: demote a live victim's overflow to the freed Host (an
+                // active session's prefix must never be destroyed while a demote of it
+                // could fit), and evict dead retained weight (long-idle contexts) to
+                // free Host and device for those demotes. Recency (victim_live) is the
+                // live/dead split — the retention weight cannot be trusted here because
+                // the live-session escalation never engages on the private-endpoint
+                // reuse path, so active sessions would otherwise rank as ordinary
+                // RecentPrivate weight and be shed before the dead weight.
+                {
+                    const detail::PhysicalResources residual =
+                        projected_residual(choice_scratch, std::nullopt, nullptr);
+                    std::optional<Selection> demote;
+                    for (const std::size_t victim_index : eviction_order) {
+                        if (!victim_live(victim_index)) { continue; }
+                        CandidateVictimOptions& victim = options.victims[victim_index];
+                        const std::uint16_t current_choice = choice_scratch[victim_index];
+                        const PressureDecision* current =
+                            current_choice == 0 ? nullptr
+                                                : &victim.decisions[current_choice - 1U];
+                        if (current != nullptr && current->evicts_continuation) { continue; }
+                        refresh_options(victim, residual, current);
+                        for (std::uint16_t choice = 1; choice <= victim.decisions.size();
+                             ++choice) {
+                            const PressureDecision& candidate = victim.decisions[choice - 1U];
+                            if (candidate.evicts_continuation) { continue; }
+                            const std::uint32_t prior_drops =
+                                current == nullptr ? 0 : current->checkpoint_drops;
+                            if (candidate.checkpoint_drops > prior_drops) { continue; }
+                            const PressureDecision* effective = &candidate;
+                            PressureDecision trimmed;
+                            if (overlaps_committed(victim_index, candidate)) {
+                                std::optional<PressureDecision> t =
+                                    trim_to_exclusive(victim_index, candidate);
+                                if (!t ||
+                                    (t->main_kv_changes.empty() &&
+                                     t->backend_kv_changes.empty() &&
+                                     t->state_changes.empty())) {
+                                    continue;
+                                }
+                                trimmed = std::move(*t);
+                                effective = &trimmed;
+                            }
+                            const detail::PhysicalResources child =
+                                projected_residual(choice_scratch, victim_index, effective);
+                            if (device_key(child) >= device_key(residual)) { continue; }
+                            if (child.host.kv_bytes != 0) { continue; }
+                            demote = Selection{
+                                .victim_index = victim_index,
+                                .decision     = *effective,
+                                .residual     = child,
+                            };
+                            break;
+                        }
+                        if (demote) { break; }
+                    }
+                    if (demote) {
+                        pp_selection("P4D", *demote);
+                        choice_scratch[demote->victim_index] = intern_selection(*demote);
+                        commit_pages(demote->victim_index, demote->decision);
+                        continue;
+                    }
+                }
+                // Evict dead retained weight to free Host and device for the demotes.
+                // Live victims are excluded here: they are the last resort and are only
+                // shed when no demote could absorb the shortfall.
                 std::optional<std::size_t> evict;
                 for (const std::size_t victim_index : eviction_order) {
-                    if (victim_weights[victim_index] >= 16) { continue; }
+                    if (victim_live(victim_index)) { continue; }
                     if (choice_scratch[victim_index] != 0) { continue; }
                     const CandidateVictimOptions& victim = options.victims[victim_index];
                     if (victim.eviction_choice == 0) { continue; }
