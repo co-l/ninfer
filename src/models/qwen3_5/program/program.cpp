@@ -167,9 +167,11 @@ std::optional<PressureTargetHandle>
 PressurePlanningSession::deterministic_target(
     runtime::PlanningCandidateId candidate,
     std::span<const runtime::PlanningOwnerId> preferred_owner_ids,
-    std::span<const std::uint32_t> preferred_owner_weights) {
+    std::span<const std::uint32_t> preferred_owner_weights,
+    std::span<const std::uint64_t> preferred_owner_epochs) {
     if (impl_ == nullptr) { throw std::logic_error("pressure planning session is empty"); }
-    return impl_->deterministic_target(candidate, preferred_owner_ids, preferred_owner_weights);
+    return impl_->deterministic_target(candidate, preferred_owner_ids, preferred_owner_weights,
+                                       preferred_owner_epochs);
 }
 
 runtime::PressureTargetGuidance PressurePlanningSession::guidance(PressureTargetHandle target) {

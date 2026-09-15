@@ -585,7 +585,8 @@ public:
     [[nodiscard]] std::optional<PressureTargetHandle>
     deterministic_target(runtime::PlanningCandidateId candidate,
                          std::span<const runtime::PlanningOwnerId> preferred_owner_ids,
-                         std::span<const std::uint32_t> preferred_owner_weights);
+                         std::span<const std::uint32_t> preferred_owner_weights,
+                         std::span<const std::uint64_t> preferred_owner_epochs);
     [[nodiscard]] runtime::PressureTargetGuidance guidance(PressureTargetHandle target);
     [[nodiscard]] AssessedPressureTarget assess(PressureTargetHandle target);
     [[nodiscard]] PreparedPressureExpansion

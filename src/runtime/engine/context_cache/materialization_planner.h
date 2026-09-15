@@ -312,14 +312,18 @@ public:
         bool budget_exhausted                         = false;
         std::vector<std::uint32_t> preferred_owner_weights;
         preferred_owner_weights.reserve(preferred_owners.size());
+        std::vector<std::uint64_t> preferred_owner_epochs;
+        preferred_owner_epochs.reserve(preferred_owners.size());
         for (const MaterializationOwnerPolicy* policy : preferred_owners) {
             preferred_owner_weights.push_back(policy->private_retention_weight);
+            preferred_owner_epochs.push_back(policy->last_hit_epoch);
         }
         for (const IdentityRoot& root : roots) {
             if (!root.expandable) { continue; }
             const std::optional<PressureTargetHandle> deterministic =
                 session.deterministic_target(candidates[root.candidate_index].id,
-                                             preferred_owner_ids, preferred_owner_weights);
+                                             preferred_owner_ids, preferred_owner_weights,
+                                             preferred_owner_epochs);
             if (!deterministic) {
                 std::fprintf(stderr, "[pl] deterministic NULLOPT cand=%u\n",
                              candidates[root.candidate_index].id.value);

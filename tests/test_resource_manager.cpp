@@ -564,7 +564,8 @@ public:
     [[nodiscard]] std::optional<FakePressureTargetHandle>
     deterministic_target(PlanningCandidateId candidate,
                          std::span<const PlanningOwnerId> preferred_owner_ids,
-                         std::span<const std::uint32_t> preferred_owner_weights = {});
+                         std::span<const std::uint32_t> preferred_owner_weights = {},
+                         std::span<const std::uint64_t> preferred_owner_epochs = {});
     [[nodiscard]] Cursor begin_construction(FakePressureTargetHandle target, bool restore = false);
     [[nodiscard]] ninfer::runtime::PressureConstructionStep
     next_construction_option(Cursor& cursor);
@@ -1375,7 +1376,9 @@ FakePressurePlanningSession::maximal_target(PlanningCandidateId candidate) {
 std::optional<FakePressureTargetHandle>
 FakePressurePlanningSession::deterministic_target(
     PlanningCandidateId admission, std::span<const PlanningOwnerId> preferred_owner_ids,
-    std::span<const std::uint32_t> preferred_owner_weights) {
+    std::span<const std::uint32_t> preferred_owner_weights,
+    std::span<const std::uint64_t> preferred_owner_epochs) {
+    (void)preferred_owner_epochs;
     const std::uint32_t selected = candidate_index(admission);
     populate_options(selected);
     std::vector<std::size_t> victim_order;

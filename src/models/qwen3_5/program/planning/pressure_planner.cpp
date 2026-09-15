@@ -772,9 +772,11 @@ inline std::optional<qwen3_5::PressureTargetHandle>
 PressurePlanningSessionImpl::deterministic_target(
     runtime::PlanningCandidateId admission,
     std::span<const runtime::PlanningOwnerId> preferred_owner_ids,
-    std::span<const std::uint32_t> preferred_owner_weights) {
-    if (preferred_owner_ids.size() != preferred_owner_weights.size()) {
-        throw std::logic_error("pressure preferred owner weights are misaligned");
+    std::span<const std::uint32_t> preferred_owner_weights,
+    std::span<const std::uint64_t> preferred_owner_epochs) {
+    if (preferred_owner_ids.size() != preferred_owner_weights.size() ||
+        preferred_owner_ids.size() != preferred_owner_epochs.size()) {
+        throw std::logic_error("pressure preferred owner arrays are misaligned");
     }
     if (scratch_live) { throw std::logic_error("pressure expansion scratch is still live"); }
     const std::uint32_t selected_candidate = candidate_index(admission);
@@ -1246,10 +1248,8 @@ PressurePlanningSessionImpl::deterministic_target(
                      d.effect.removed.host.kv_bytes, d.checkpoint_drops);
     };
 
-    // Eviction order: smallest victims first (least destructive), stable within the value
-    // ranking. The hit-count model is degenerate for this workload (no selections observed,
-    // so value order reduces to ID order and evicts the largest live mains first). Preferring
-    // smaller victims protects the big long-lived contexts and chains the dead small ones.
+    // Victim size in main+backend pages, used only as the final tiebreak of the
+    // value-ranked eviction order below.
     const auto victim_size = [&](std::size_t victim_index) -> std::uint64_t {
         const auto kv = owner_kv(victim_index);
         std::uint64_t pages = 0;
@@ -1263,13 +1263,21 @@ PressurePlanningSessionImpl::deterministic_target(
     };
     std::vector<std::size_t> eviction_order = victim_order;
     // Value-ranked eviction order: retention weight is the primary key (shared/absent
-    // weight sheds first, recently-active live sessions last), with size as a tiebreak
-    // within a weight so the least destructive victim of a class is evicted first. A
-    // pure size key would reorder across weights and evict a small live main before a
-    // larger idle one on a saturated instance; a pure value key would pick an arbitrary
-    // critical main at the finalize squeeze instead of the smallest one.
+    // weight sheds first, recently-active live sessions last), then recency (least
+    // recently hit sheds first; a never-hit epoch-0 victim is freshly admitted and
+    // protected, matching the planner's ranking), then size as a final tiebreak so the
+    // least destructive victim of a class is evicted first. Recency is what actually
+    // separates live sessions from dead retained weight when both carry the same
+    // retention weight (e.g. RecentPrivate): an actively-stepping session's epoch
+    // advances every turn, a long-idle retained context's is frozen, so the dead weight
+    // sheds before a live main regardless of size. A pure size key does the opposite —
+    // the live mains are the largest RecentPrivate victims and get shed before the small
+    // dead contexts, which is the ~130K working-set mass-eviction defect.
     std::vector<std::uint32_t> victim_weights(options.victims.size(), 0);
-    for (std::size_t index = 0; index < preferred_owner_ids.size() && index < preferred_owner_weights.size();
+    std::vector<std::uint64_t> victim_epochs(options.victims.size(), 0);
+    for (std::size_t index = 0;
+         index < preferred_owner_ids.size() && index < preferred_owner_weights.size() &&
+         index < preferred_owner_epochs.size();
          ++index) {
         const auto found = std::find_if(
             options.victims.begin(), options.victims.end(), [&](const auto& victim) {
@@ -1279,6 +1287,8 @@ PressurePlanningSessionImpl::deterministic_target(
         if (found != options.victims.end()) {
             victim_weights[static_cast<std::size_t>(found - options.victims.begin())] =
                 preferred_owner_weights[index];
+            victim_epochs[static_cast<std::size_t>(found - options.victims.begin())] =
+                preferred_owner_epochs[index];
         }
     }
     std::stable_sort(eviction_order.begin(), eviction_order.end(),
@@ -1286,14 +1296,13 @@ PressurePlanningSessionImpl::deterministic_target(
                          const std::uint32_t left_weight  = victim_weights[left];
                          const std::uint32_t right_weight = victim_weights[right];
                          if (left_weight != right_weight) { return left_weight < right_weight; }
-                         // Live sessions (weight 16): least destructive first (smallest) so
-                         // the finalize squeeze sheds the smallest main. Dead weight (≤ 4):
-                         // shed the LARGEST first so a small freshly-started session is not
-                         // the first RecentPrivate victim on a saturated instance.
-                         const std::uint64_t left_size  = victim_size(left);
-                         const std::uint64_t right_size = victim_size(right);
-                         if (left_weight <= 4) { return left_size > right_size; }
-                         return left_size < right_size;
+                         const std::uint64_t left_epoch =
+                             victim_epochs[left] == 0 ? ~std::uint64_t{0} : victim_epochs[left];
+                         const std::uint64_t right_epoch =
+                             victim_epochs[right] == 0 ? ~std::uint64_t{0}
+                                                       : victim_epochs[right];
+                         if (left_epoch != right_epoch) { return left_epoch < right_epoch; }
+                         return victim_size(left) < victim_size(right);
                      });
 
     // Phase 1 — device waterfall: while the device is over-committed, demote the
