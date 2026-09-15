@@ -1416,10 +1416,23 @@ PressurePlanningSessionImpl::deterministic_target(
                         continue;
                     }
                     if (owners[options.victims[victim_index].owner_index].shared) { continue; }
+                    // Live victims are never host-relief evicted here: their overflow is
+                    // demoted (or shed) by the later phases, which can spend the Host that
+                    // these dead-weight evictions free. Evicting an active session here
+                    // destroys a prefix a demote could have preserved — and it ranks before
+                    // P4's fix-up, whose evict branch already applies this same liveness
+                    // split.
+                    if (victim_live(victim_index)) { continue; }
                 } else {
                     const bool adds_drops    = candidate.checkpoint_drops > prior_drops;
                     const bool frees_host_kv = candidate.effect.removed.host.kv_bytes != 0;
                     if (!adds_drops && !frees_host_kv) { continue; }
+                    // Stripping a checkpoint (endpoint/rewrite/anchor) makes the
+                    // continuation non-resumable: its prefix-index entry disappears and the
+                    // next request for the same prefix falls to root. Only dead retained
+                    // weight may be stripped here — a live session's state is demoted (a
+                    // copy survives) instead, never destroyed.
+                    if (adds_drops && victim_live(victim_index)) { continue; }
                     if (overlaps_committed(victim_index, candidate)) { continue; }
                 }
                 const detail::PhysicalResources child =
