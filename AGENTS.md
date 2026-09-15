@@ -420,7 +420,7 @@ Hygiene (results are only comparable when these hold):
 | source tree | `/home/conrad/dev/nicefox-5090-prod` (plain tree, **not** a git repo; a clean copy of this repository — git-tracked files only, deployed by `./deploy.sh` — plus the box-local `models/` + `logs/`; the cache-fix planner work is committed on the `nicefox` remote, no patch files) |
 | artifact | `models/qwen3_8_27b_nvfp4.ninfer` (21.5 GB / 20.0 GiB, Qwen3.8-27B NVFP4; sha256 `bb336052…`, = HF `3b84117`) |
 | image | `localhost/ninfer:local` (Dockerfile: CUDA 13.1.2-devel/Ubuntu 24.04, `podman build --jobs 4` with ninja parallelism via `BUILD_PARALLEL`, default 16; measured: compile peaks at ~7 GiB RAM and takes ~4 min — CPU-bound, not RAM-bound) |
-| container | `ninfer-serve` via `./start.sh` (launch) / `./stop.sh` (stop) in this repo (rootful podman, GPU 0, ports 8000, mounts `models/` ro + `logs/`); env overrides `NINFER_CONCURRENCY` (4), `NINFER_KV_CAPACITY` (460000), `NINFER_KV_DTYPE` (nvfp4), `NINFER_DEVICE_STATE_SLOTS` (4), `NINFER_VISION` (1) |
+| container | `ninfer-serve` via `./start.sh` (launch) / `./stop.sh` (stop) in this repo (rootful podman, GPU 0, ports 8000, mounts `models/` ro + `logs/`); all knobs are config in `.env` (copy `.env.example`) — runtime (podman/docker), `BOX`, `REMOTE_DIR`, ports, artifact path, serving flags, `EXTRA_MOUNTS`, `SERVE_LOG` — with shell env overriding the file |
 | request log | `/home/conrad/dev/nicefox-5090-prod/logs/requests.jsonl` |
 | health | `curl -sf localhost:8000/health` on the box (model load is seconds; serve log shows `engine ready`) |
 
@@ -465,9 +465,9 @@ absolute target path:
 ln -s /home/conrad/.cache/huggingface/hub/models--<repo>/snapshots/<rev>/<file>.ninfer \
       /home/conrad/dev/nicefox-5090-prod/models/<file>.ninfer
 
-# launch (replicating start.sh's recipe) with an extra ro mount so the
-# symlink target resolves inside the container:
-#   -v /home/conrad/.cache/huggingface:/home/conrad/.cache/huggingface:ro
+# then configure start.sh via .env (see .env.example):
+#   ARTIFACT=/models/<file>.ninfer
+#   EXTRA_MOUNTS="-v /home/conrad/.cache/huggingface:/home/conrad/.cache/huggingface:ro"
 ```
 
 Example (verified 2026-09-15):
@@ -493,10 +493,11 @@ cache-fix planner work is committed on the `nicefox` remote.
    server + build together exceed the box's 30 GiB), then builds
    `localhost/ninfer:local` on the box
    (`sudo podman build --jobs 4 -t ninfer:local .` with
-   `--build-arg BUILD_PARALLEL=$PARALLEL`, default 16 → ~4 min).
-   `./deploy.sh --dry-run` shows the sync plan without building. Env
-   overrides: `BOX`, `REMOTE_DIR`, `IMAGE`, `PARALLEL`. Box must be on
-   (`ssh gaming_pc`), else the script exits with a pointer to
+   `--build-arg BUILD_PARALLEL=$BUILD_PARALLEL`, default 16 → ~4 min).
+   `./deploy.sh --dry-run` shows the sync plan without building. All knobs
+   come from `.env` (shell env > `.env` > defaults): `BOX`, `REMOTE_DIR`,
+   `IMAGE`, `BUILD_PARALLEL`, `CONTAINER_RUNTIME`, `CONTAINER_SUDO`, … The
+   box must be on (`ssh gaming_pc`), else the script exits with a pointer to
    `../5090/poweron-gaming-pc.sh`.
 3. Launch: `./start.sh` — launches `ninfer-serve` detached on the box and
    returns once the log shows `listening on` (never tails forever). `./stop.sh`

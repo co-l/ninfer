@@ -218,6 +218,70 @@ docker run --rm \
   --preserve-thinking
 ```
 
+## Deploying to an inference box
+
+The repository ships three scripts to run the engine on a remote box (by default
+`gaming_pc` over ssh): `deploy.sh` syncs the git-tracked sources and rebuilds the
+serving image, `start.sh` launches `ninfer-serve` detached and returns once it is
+listening, and `stop.sh` stops it. All knobs live in a `.env` file:
+
+```bash
+cp .env.example .env   # then edit
+```
+
+Configuration precedence is **shell environment > `.env` > built-in defaults**, per
+variable. `.env` is git-ignored; `.env.example` documents every key with its default.
+
+Key settings:
+
+| Variable | Default | Meaning |
+|---|---|---|
+| `BOX` | `gaming_pc` | ssh host for the inference box |
+| `REMOTE_DIR` | `/home/conrad/dev/nicefox-5090-prod` | source tree on the box |
+| `IMAGE` | `localhost/ninfer:local` | image built and served |
+| `BUILD_PARALLEL` | `16` | ninja jobs used by the image build |
+| `CONTAINER_RUNTIME` | `podman` | container runtime: `podman` or `docker` |
+| `CONTAINER_SUDO` | `sudo` | prefix for runtime commands; empty when the user can run the runtime directly |
+| `CONTAINER_NAME` | `ninfer-serve` | container name |
+| `GPU_DEVICE` | `0` | GPU exposed to the container |
+| `HOST_PORT` / `CONTAINER_PORT` | `8000` | published / in-container port |
+| `ARTIFACT` | `/models/qwen3_8_27b_nvfp4.ninfer` | model artifact path inside the container |
+| `MODEL_ID` | `qwen3.8-27b` | model id advertised by the server |
+| `KV_CAPACITY` | `460000` | shared KV pool size |
+| `KV_DTYPE` | `nvfp4` | KV storage dtype |
+| `SPEC` / `DRAFT_TOKENS` | `mtp` / `4` | speculative decoding profile |
+| `EXTRA_MOUNTS` | *(empty)* | extra `-v` mounts, space-separated |
+| `SERVE_LOG` | `$REMOTE_DIR/serve.log` | serve log path on the box |
+
+The remaining serving flags (`MAX_CONTEXT`, `CONCURRENCY`, `HOST_STATE_SLOTS`,
+`HOST_KV_MIB`, `MAX_PRIVATE_CONTINUATIONS`, `MAX_SHARED_PREFIXES`, `VISION`, …) are
+also configurable — see `.env.example` for the full list.
+
+Typical workflow:
+
+```bash
+./deploy.sh --dry-run   # show the sync plan without building
+./deploy.sh             # sync sources + stop the server + rebuild the image
+./start.sh              # launch ninfer-serve, return once listening
+./stop.sh               # stop ninfer-serve
+```
+
+`deploy.sh` stops the server before building because the serving footprint (~28 GiB)
+and the compile (~7 GiB) do not fit in the box's RAM together. The box must be
+reachable over ssh and, when `CONTAINER_RUNTIME=podman` (the default), the rootless
+GPU passthrough device `--device nvidia.com/gpu=$GPU_DEVICE` is used; with
+`CONTAINER_RUNTIME=docker` the equivalent `--gpus device=$GPU_DEVICE` is passed.
+
+To serve an alternate artifact kept in the Hugging Face cache without copying it,
+symlink the cached blob into `models/` and point `ARTIFACT` at the symlink, adding a
+read-only mount for the cache root via `EXTRA_MOUNTS`:
+
+```bash
+# .env
+ARTIFACT=/models/Swift-Qwen3.8-27B-OrcaRouter-NVFP4-DFlash2.ninfer
+EXTRA_MOUNTS="-v /home/conrad/.cache/huggingface:/home/conrad/.cache/huggingface:ro"
+```
+
 ## Capabilities and limits
 
 The official artifacts provide the following capabilities, with optional components enabled at startup:

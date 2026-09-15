@@ -11,18 +11,32 @@
 #
 # Usage: ./deploy.sh [--dry-run]
 #   --dry-run  show the sync plan only (no build)
-#   env overrides: BOX (ssh host), REMOTE_DIR, IMAGE, PARALLEL (ninja jobs)
-#   next steps after a real deploy:
-#     ../5090/launch-gaming-pc.sh   # serve (stops vLLM/SGLang, starts ninfer)
-#     # then the cache-pressure bench suite (agent-sim, needle-test, cache-pressure)
+#
+# Configuration: shell env > ./.env (copy .env.example) > defaults below.
+#   BOX, REMOTE_DIR, IMAGE, BUILD_PARALLEL (ninja jobs),
+#   CONTAINER_RUNTIME (podman|docker), CONTAINER_SUDO, CONTAINER_NAME.
+#
+# Next steps after a real deploy:
+#   ./start.sh   # serve (stops vLLM/SGLang, starts ninfer)
+#   # then the cache-pressure bench suite (agent-sim, needle-test, cache-pressure)
 
 set -euo pipefail
+. "$(cd -- "$(dirname -- "$0")" && pwd)/deploy-lib.sh"
+load_env
 
 BOX="${BOX:-gaming_pc}"
 REMOTE_DIR="${REMOTE_DIR:-/home/conrad/dev/nicefox-5090-prod}"
 IMAGE="${IMAGE:-localhost/ninfer:local}"
-PARALLEL="${PARALLEL:-16}"
+BUILD_PARALLEL="${BUILD_PARALLEL:-16}"
+CONTAINER_RUNTIME="${CONTAINER_RUNTIME:-podman}"
+CONTAINER_SUDO="${CONTAINER_SUDO-sudo}"
+CONTAINER_NAME="${CONTAINER_NAME:-ninfer-serve}"
 SSH=(ssh -o ConnectTimeout=8 -o BatchMode=yes)
+
+case "$CONTAINER_RUNTIME" in
+  podman | docker) ;;
+  *) echo "error: CONTAINER_RUNTIME must be podman or docker (got '$CONTAINER_RUNTIME')" >&2; exit 1 ;;
+esac
 
 DRY_RUN=0
 if [ "${1:-}" = "--dry-run" ]; then DRY_RUN=1; fi
@@ -49,13 +63,20 @@ if [ "$DRY_RUN" = 1 ]; then
   exit 0
 fi
 
-"${SSH[@]}" "$BOX" 'sudo podman stop ninfer-serve 2>/dev/null || true'
+"${SSH[@]}" "$BOX" "$(join_remote "${CONTAINER_SUDO:+$CONTAINER_SUDO}" "$CONTAINER_RUNTIME" stop "$CONTAINER_NAME") 2>/dev/null || true"
 
-echo "building $IMAGE on $BOX (podman --jobs 4, ninja $PARALLEL, ~4 min)..."
-# Stream podman build output through a line-buffered filter: keep STEP/cache
-# progress plus every compiler warning and error, drop ninja per-file progress,
-# short layer echoes, and blank lines. pipefail keeps a failed build non-zero.
-"${SSH[@]}" "$BOX" "cd $REMOTE_DIR && sudo podman build --jobs 4 --build-arg BUILD_PARALLEL=$PARALLEL -t $IMAGE ." 2>&1 | awk '
+build=()
+[ -n "$CONTAINER_SUDO" ] && build+=("$CONTAINER_SUDO")
+build+=("$CONTAINER_RUNTIME" build)
+[ "$CONTAINER_RUNTIME" = podman ] && build+=(--jobs 4)
+build+=(--build-arg "BUILD_PARALLEL=$BUILD_PARALLEL" -t "$IMAGE" .)
+
+echo "building $IMAGE on $BOX ($CONTAINER_RUNTIME, ninja $BUILD_PARALLEL, ~4 min)..."
+# Stream the container build output through a line-buffered filter: keep
+# STEP/cache progress plus every compiler warning and error, drop ninja
+# per-file progress, short layer echoes, and blank lines. pipefail keeps a
+# failed build non-zero.
+"${SSH[@]}" "$BOX" "cd $(printf '%q' "$REMOTE_DIR") && $(join_remote "${build[@]}")" 2>&1 | awk '
   /^\[[0-9]+\/[0-9]+\] (Building|Linking) / { next }
   /^--> [0-9a-f]{12}$/ { next }
   NF == 0 { next }
@@ -64,5 +85,5 @@ echo "building $IMAGE on $BOX (podman --jobs 4, ninja $PARALLEL, ~4 min)..."
 echo
 echo "deploy complete: $BOX:$REMOTE_DIR built $IMAGE"
 echo "next:"
-echo "  ../5090/launch-gaming-pc.sh    # serve (stops vLLM/SGLang, starts ninfer)"
+echo "  ./start.sh    # serve (stops vLLM/SGLang, starts ninfer)"
 echo "  # then the cache-pressure bench suite from the workstation"

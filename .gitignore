@@ -34,6 +34,9 @@ venv/
 /models/
 out/
 
+# Local configuration (copy .env.example)
+/.env
+
 # Local workspace and transient runtime output
 /.local/
 /temp/
