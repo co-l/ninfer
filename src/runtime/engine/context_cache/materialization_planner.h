@@ -227,6 +227,7 @@ public:
         };
 
         Incumbent incumbent;
+        bool incumbent_set = false;
         std::uint32_t targets_evaluated = static_cast<std::uint32_t>(candidates.size());
         std::vector<const MaterializationOwnerPolicy*> preferred_owners;
         preferred_owners.reserve(pressure.owner_policy.size());
@@ -276,12 +277,22 @@ public:
         for (const MaterializationOwnerPolicy* policy : preferred_owners) {
             preferred_owner_ids.push_back(policy->owner);
         }
+        std::vector<std::uint32_t> preferred_owner_weights;
+        preferred_owner_weights.reserve(preferred_owners.size());
+        std::vector<std::uint64_t> preferred_owner_epochs;
+        preferred_owner_epochs.reserve(preferred_owners.size());
+        for (const MaterializationOwnerPolicy* policy : preferred_owners) {
+            preferred_owner_weights.push_back(policy->private_retention_weight);
+            preferred_owner_epochs.push_back(policy->last_hit_epoch);
+        }
         if (identity_best) {
             incumbent        = std::move(*identity_best);
             incumbent.target = session.identity_target(candidates[incumbent.candidate_index].id);
+            incumbent_set    = true;
         } else {
             PressureTargetHandle root_maximal =
-                session.root_maximal_target(candidates[root_candidate_index].id);
+                session.root_maximal_target(candidates[root_candidate_index].id,
+                                            preferred_owner_ids, preferred_owner_weights);
             AssessedPressureTarget assessed            = session.assess(root_maximal);
             const PressureTargetAssessment& assessment = assessed.assessment();
             if (assessment.candidate != candidates[root_candidate_index].id) {
@@ -294,13 +305,21 @@ public:
                 goal = logical_goal(assessment.candidate, assessment.source_mode,
                                     assessment.owner_outcomes);
             }
-            if (!goal) { return std::nullopt; }
-            const FoldedCost cost =
-                fold_assessment(candidates[root_candidate_index], assessment, pressure.owner_policy,
-                                pressure.checkpoint_policy, machine_cost);
-            incumbent = make_incumbent(root_maximal, root_candidate_index, assessment,
-                                       std::move(assessed), cost, *goal);
-            mark_target(assessment.stable_target_ordinal, kTargetDiscovered | kTargetAssessed);
+            if (goal) {
+                const FoldedCost cost =
+                    fold_assessment(candidates[root_candidate_index], assessment,
+                                    pressure.owner_policy, pressure.checkpoint_policy,
+                                    machine_cost);
+                incumbent     = make_incumbent(root_maximal, root_candidate_index, assessment,
+                                               std::move(assessed), cost, *goal);
+                incumbent_set = true;
+                mark_target(assessment.stable_target_ordinal,
+                            kTargetDiscovered | kTargetAssessed);
+            }
+            // If the non-destructive last-resort fallback is itself infeasible (e.g. only
+            // live sessions hold the device pages the growth needs), do NOT give up here:
+            // the deterministic planner below may still find a feasible demote-based plan.
+            // The request is rejected only when every plan fails.
         }
 
         // Deterministic value-ranked planning: for every candidate that cannot be
@@ -310,14 +329,6 @@ public:
         const Clock::time_point deterministic_started = Clock::now();
         MaterializationStopReason stop_reason         = MaterializationStopReason::QueueExhausted;
         bool budget_exhausted                         = false;
-        std::vector<std::uint32_t> preferred_owner_weights;
-        preferred_owner_weights.reserve(preferred_owners.size());
-        std::vector<std::uint64_t> preferred_owner_epochs;
-        preferred_owner_epochs.reserve(preferred_owners.size());
-        for (const MaterializationOwnerPolicy* policy : preferred_owners) {
-            preferred_owner_weights.push_back(policy->private_retention_weight);
-            preferred_owner_epochs.push_back(policy->last_hit_epoch);
-        }
         for (const IdentityRoot& root : roots) {
             if (!root.expandable) { continue; }
             const std::optional<PressureTargetHandle> deterministic =
@@ -350,13 +361,19 @@ public:
                              static_cast<int>(assessment.physical_status));
                 continue;
             }
-            if (cost.less(incumbent.cost)) {
-                incumbent = make_incumbent(*deterministic, root.candidate_index, assessment,
-                                           std::move(assessed), cost, *goal);
+            if (!incumbent_set || cost.less(incumbent.cost)) {
+                incumbent     = make_incumbent(*deterministic, root.candidate_index, assessment,
+                                               std::move(assessed), cost, *goal);
+                incumbent_set = true;
             }
         }
 
         const std::uint64_t search_elapsed_ns = elapsed_ns(deterministic_started, Clock::now());
+        if (!incumbent_set) {
+            std::fprintf(stderr, "[pl] NO FEASIBLE TARGET cand=%u\n",
+                         candidates[root_candidate_index].id.value);
+            return std::nullopt;
+        }
         if (!incumbent.assessed) {
             AssessedPressureTarget assessed            = session.assess(incumbent.target);
             const PressureTargetAssessment& assessment = assessed.assessment();

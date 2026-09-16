@@ -566,7 +566,9 @@ public:
     [[nodiscard]] PressureTargetHandle
     identity_target(runtime::PlanningCandidateId candidate) const;
     [[nodiscard]] PressureTargetHandle
-    root_maximal_target(runtime::PlanningCandidateId root_candidate);
+    root_maximal_target(runtime::PlanningCandidateId root_candidate,
+                        std::span<const runtime::PlanningOwnerId> preferred_owner_ids,
+                        std::span<const std::uint32_t> preferred_owner_weights);
     [[nodiscard]] PressureTargetHandle maximal_target(runtime::PlanningCandidateId candidate);
     [[nodiscard]] PressureConstructionCursor begin_construction(PressureTargetHandle target,
                                                                 bool restore = false);

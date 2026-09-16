@@ -214,6 +214,8 @@ void ProgramImpl::release_continuation_slot_strict(std::uint32_t index) noexcept
     try {
         if (!can_release_continuation_slot_strict(index)) { std::terminate(); }
     } catch (...) { std::terminate(); }
+    std::fprintf(stderr, "[REL2] program release continuation index=%u gen=%llu\n", index,
+                 static_cast<unsigned long long>(continuation_slots[index].generation));
     SequenceState& sequence = continuation_states[index];
     release_sequence_kv_strict(sequence);
     release_sequence_state_strict(sequence);
@@ -258,6 +260,7 @@ void ProgramImpl::retire_continuation_slot(std::uint32_t index) noexcept {
     ContinuationSlot& slot = continuation_slots[index];
     slot.role              = ContinuationSlotRole::Free;
     if (++slot.generation == 0) { ++slot.generation; }
+    release_dead_shared_prefix_closures();
 }
 
 detail::PhysicalResources
@@ -491,8 +494,12 @@ ProgramImpl::guided_materialization_deficit(const ResourceCandidateState& admiss
     return positive_resource_difference(required, admission_capacity());
 }
 
-bool
-ProgramImpl::host_kv_requests_fit(std::span<const std::uint32_t> main_pages,
+// Mirrors compose_pressure_candidate's Host extent admission for the planner's cheap
+// model: reports whether the given demote page-counts (main and backend) fit the Host
+// arena's CURRENT free extents. The byte-total model can be optimistic when free space
+// is fragmented; this is the allocator's real answer (releases only add space, so
+// asking without the plan's releases is conservative and safe).
+bool ProgramImpl::host_kv_requests_fit(std::span<const std::uint32_t> main_pages,
                                   std::span<const std::uint32_t> back_pages) const {
     std::vector<HostKVAllocationRequest> requests;
     requests.reserve(main_pages.size() + back_pages.size());
@@ -535,6 +542,12 @@ bool ProgramImpl::physical_peak_fits(detail::PhysicalResources peak) const noexc
                     limits.device.backend_kv_pages) &&
            fits_u32(occupied.host.state_slots, peak.host.state_slots, limits.host.state_slots) &&
            fits_size(occupied.host.kv_bytes, peak.host.kv_bytes, limits.host.kv_bytes);
+}
+
+bool ProgramImpl::physical_peak_fits_trust_host_allocation(
+    detail::PhysicalResources peak) const noexcept {
+    peak.host.kv_bytes = 0;
+    return physical_peak_fits(peak);
 }
 
 StateImageHandle
@@ -1518,7 +1531,13 @@ void ProgramImpl::release_active_sequence_kv_strict(SequenceState& sequence) noe
     }
     if (!text_kv_addresses->release_after_deactivate(sequence.kv->text)) { std::terminate(); }
     sequence.kv.reset();
-    if (host_kv_extents) { (void)host_kv_extents->release_unreferenced(); }
+    if (host_kv_extents) {
+        const std::size_t freed = host_kv_extents->release_unreferenced();
+        if (freed != 0) {
+            std::fprintf(stderr, "[ORPHAN] freed=%zu bytes occ=%zu\n", freed,
+                         static_cast<std::size_t>(host_kv_extents->arena_occupied_bytes()));
+        }
+    }
 }
 
 void ProgramImpl::release_sequence_kv_strict(SequenceState& sequence) noexcept {
@@ -1534,7 +1553,13 @@ void ProgramImpl::release_sequence_kv_strict(SequenceState& sequence) noexcept {
     }
     if (!text_kv_addresses->release(sequence.kv->text)) { std::terminate(); }
     sequence.kv.reset();
-    if (host_kv_extents) { (void)host_kv_extents->release_unreferenced(); }
+    if (host_kv_extents) {
+        const std::size_t freed = host_kv_extents->release_unreferenced();
+        if (freed != 0) {
+            std::fprintf(stderr, "[ORPHAN] freed=%zu bytes occ=%zu\n", freed,
+                         static_cast<std::size_t>(host_kv_extents->arena_occupied_bytes()));
+        }
+    }
 }
 
 void ProgramImpl::release_sequence_kv(SequenceState& sequence) noexcept {
@@ -1545,7 +1570,13 @@ void ProgramImpl::release_sequence_kv(SequenceState& sequence) noexcept {
     }
     if (text_kv_addresses) { (void)text_kv_addresses->release(sequence.kv->text); }
     sequence.kv.reset();
-    if (host_kv_extents) { (void)host_kv_extents->release_unreferenced(); }
+    if (host_kv_extents) {
+        const std::size_t freed = host_kv_extents->release_unreferenced();
+        if (freed != 0) {
+            std::fprintf(stderr, "[ORPHAN] freed=%zu bytes occ=%zu\n", freed,
+                         static_cast<std::size_t>(host_kv_extents->arena_occupied_bytes()));
+        }
+    }
 }
 
 qwen3_5::PagedKVCacheView ProgramImpl::text_kv_view(const SequenceState& sequence) const {

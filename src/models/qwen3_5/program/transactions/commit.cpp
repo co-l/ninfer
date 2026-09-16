@@ -767,8 +767,140 @@ ProgramImpl::release_shared_prefix_state_strict(std::uint32_t index,
         shared    = SharedPrefixState{};
         slot.role = SharedPrefixSlotRole::Free;
         if (++slot.generation == 0) { ++slot.generation; }
-        if (host_kv_extents) { (void)host_kv_extents->release_unreferenced(); }
+        if (host_kv_extents) {
+            const std::size_t freed = host_kv_extents->release_unreferenced();
+            if (freed != 0) {
+                std::fprintf(stderr, "[ORPHAN] freed=%zu bytes occ=%zu\n", freed,
+                             static_cast<std::size_t>(host_kv_extents->arena_occupied_bytes()));
+            }
+        }
         return removed;
+    } catch (...) { std::terminate(); }
+}
+
+void ProgramImpl::release_dead_shared_prefix_closures() noexcept {
+    // A shared prefix is dead when no continuation (parked or active) references it and its
+    // pages are referenced only by other dead prefixes (a nested dead closure). Nested chains
+    // circularly pin each other against the all-or-nothing per-prefix can_release gate, so the
+    // whole dead closure is released together: confinement is verified first (every page's
+    // address references are exactly the references held by the dead set), then each confined
+    // prefix drops its own references via release_passive.
+    try {
+        if (has_context_transaction() || pending_transaction_) { return; }
+        std::vector<std::uint32_t> dead;
+        dead.reserve(shared_prefix_capacity);
+        for (std::uint32_t index = 0; index < shared_prefix_capacity; ++index) {
+            if (shared_prefix_slots[index].role != SharedPrefixSlotRole::Catalogued) { continue; }
+            SharedPrefixState& shared = shared_prefix_states[index];
+            if (shared.active_references != 0 || !shared.kv || !shared.identity) { continue; }
+            // A shared prefix hit within the activity window is retained even when
+            // currently unreferenced: the sweep runs on every continuation retirement
+            // and must not pre-empt the planner's weight/recency decision for content a
+            // client may still re-send. The planner sheds it under real pressure instead.
+            if (shared.last_hit_epoch != 0 &&
+                next_shared_hit_epoch_ - shared.last_hit_epoch <= kSharedHitActivityWindow) {
+                continue;
+            }
+            if (!state_store || !state_store->valid(shared.state)) { continue; }
+            if (!text_kv_addresses || !text_kv_addresses->valid(shared.kv->text)) { continue; }
+            if (shared.kv->backend &&
+                (!backend_kv_addresses || !backend_kv_addresses->valid(*shared.kv->backend))) {
+                continue;
+            }
+            bool referenced = false;
+            for (std::uint32_t c = 0; c < continuation_capacity; ++c) {
+                if (continuation_slots[c].role == ContinuationSlotRole::Free) { continue; }
+                const std::vector<std::uint32_t>& refs =
+                    continuation_states[c].shared_prefix_references;
+                if (std::find(refs.begin(), refs.end(), index) != refs.end()) {
+                    referenced = true;
+                    break;
+                }
+            }
+            if (referenced) { continue; }
+            dead.push_back(index);
+        }
+        if (dead.empty()) { return; }
+        std::vector<std::uint32_t> text_dead_refs(text_kv_pages->capacity(), 0);
+        std::vector<std::uint32_t> back_dead_refs(
+            backend_kv_pages ? backend_kv_pages->capacity() : 0, 0);
+        for (const std::uint32_t index : dead) {
+            const SharedPrefixState& shared = shared_prefix_states[index];
+            const std::uint32_t text_mapped =
+                text_kv_addresses->mapped_pages(shared.kv->text);
+            for (std::uint32_t off = 0; off < text_mapped; ++off) {
+                const LogicalKVPageHandle page =
+                    text_kv_addresses->logical_page(shared.kv->text, off);
+                ++text_dead_refs[page.index()];
+            }
+            if (shared.kv->backend) {
+                const std::uint32_t back_mapped =
+                    backend_kv_addresses->mapped_pages(*shared.kv->backend);
+                for (std::uint32_t off = 0; off < back_mapped; ++off) {
+                    const LogicalKVPageHandle page =
+                        backend_kv_addresses->logical_page(*shared.kv->backend, off);
+                    ++back_dead_refs[page.index()];
+                }
+            }
+        }
+        bool released_any = false;
+        for (const std::uint32_t index : dead) {
+            SharedPrefixState& shared = shared_prefix_states[index];
+            if (shared_prefix_slots[index].role != SharedPrefixSlotRole::Catalogued) { continue; }
+            bool confined = true;
+            const std::uint32_t text_mapped =
+                text_kv_addresses->mapped_pages(shared.kv->text);
+            for (std::uint32_t off = 0; off < text_mapped; ++off) {
+                const LogicalKVPageHandle page =
+                    text_kv_addresses->logical_page(shared.kv->text, off);
+                if (text_kv_pages->address_references(page) != text_dead_refs[page.index()]) {
+                    confined = false;
+                    break;
+                }
+            }
+            if (confined && shared.kv->backend) {
+                const std::uint32_t back_mapped =
+                    backend_kv_addresses->mapped_pages(*shared.kv->backend);
+                for (std::uint32_t off = 0; off < back_mapped; ++off) {
+                    const LogicalKVPageHandle page =
+                        backend_kv_addresses->logical_page(*shared.kv->backend, off);
+                    if (backend_kv_pages->address_references(page) !=
+                        back_dead_refs[page.index()]) {
+                        confined = false;
+                        break;
+                    }
+                }
+            }
+            if (!confined) { continue; }
+            const std::uint32_t state_references =
+                state_store->checkpoint_references(shared.state);
+            if (state_references == 0 ||
+                (state_references == 1 &&
+                 !state_store->can_release_after_checkpoint_references(shared.state, 1))) {
+                continue;
+            }
+            const bool last_state_reference = state_references == 1;
+            if (shared.kv->backend &&
+                !backend_kv_addresses->release_passive(*shared.kv->backend)) {
+                std::terminate();
+            }
+            if (!text_kv_addresses->release_passive(shared.kv->text)) { std::terminate(); }
+            state_store->release_checkpoint_reference(shared.state);
+            if (last_state_reference && !state_store->release(shared.state)) { std::terminate(); }
+            shared                              = SharedPrefixState{};
+            shared_prefix_slots[index].role     = SharedPrefixSlotRole::Free;
+            if (++shared_prefix_slots[index].generation == 0) {
+                ++shared_prefix_slots[index].generation;
+            }
+            released_any = true;
+        }
+        if (released_any && host_kv_extents) {
+            const std::size_t freed = host_kv_extents->release_unreferenced();
+            if (freed != 0) {
+                std::fprintf(stderr, "[CLOSURE] freed=%zu bytes occ=%zu\n", freed,
+                             static_cast<std::size_t>(host_kv_extents->arena_occupied_bytes()));
+            }
+        }
     } catch (...) { std::terminate(); }
 }
 

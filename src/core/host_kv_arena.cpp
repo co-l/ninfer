@@ -414,10 +414,18 @@ bool HostKVArena::can_allocate_after_suballocation_releases(
 
     for (std::size_t index = 0; index < proposed_releases.size(); ++index) {
         const HostKVSuballocationRelease& release = proposed_releases[index];
-        if (!valid_handle(release.allocation) || release.page_count == 0) { return false; }
+        if (!valid_handle(release.allocation) || release.page_count == 0) {
+            std::fprintf(stderr,
+                         "[ARENA] release-invalid idx=%zu valid=%d pages=%u\n", index,
+                         valid_handle(release.allocation) ? 1 : 0, release.page_count);
+            return false;
+        }
         const Descriptor& descriptor = descriptors_[release.allocation.descriptor_];
         if (release.begin_page > descriptor.pages ||
             release.page_count > descriptor.pages - release.begin_page) {
+            std::fprintf(stderr,
+                         "[ARENA] release-bounds idx=%zu begin=%u count=%u desc_pages=%u\n", index,
+                         release.begin_page, release.page_count, descriptor.pages);
             return false;
         }
         const std::uint32_t end = release.begin_page + release.page_count;
@@ -439,7 +447,11 @@ bool HostKVArena::can_allocate_after_suballocation_releases(
     }
 
     std::size_t available_descriptors = free_descriptors_.size();
-    std::size_t required_descriptors  = target_allocations.size();
+    // Each target allocation consumes one arena descriptor at commit (the extent
+    // store's prepare calls arena::allocate once per extent piece). Charge the full
+    // target count up front, then only the *extra* descriptors that packing across
+    // multiple free extents adds — mirroring the real commit's descriptor demand.
+    std::size_t required_descriptors = target_allocations.size();
     for (std::size_t index = 0; index < proposed_releases.size(); ++index) {
         const HostKVAllocationHandle allocation = proposed_releases[index].allocation;
         bool first                              = true;
@@ -472,8 +484,11 @@ bool HostKVArena::can_allocate_after_suballocation_releases(
             required_descriptors += retained_runs - 1U;
         }
     }
-    if (required_descriptors > available_descriptors) { return false; }
 
+    // Pack each allocation across the available free extents (largest first), mirroring
+    // HostKVExtentStore::prepare's fallback: under Host churn the tier fragments into
+    // slivers that individually cannot hold a whole demote, and a single-request
+    // rejection would declare a plan infeasible despite ample aggregate free space.
     for (const HostKVAllocationRequest& request : target_allocations) {
         if (request.layout == nullptr || request.pages == 0) { return false; }
         const std::optional<std::uint32_t> layout_index = find_layout(*request.layout);
@@ -481,15 +496,52 @@ bool HostKVArena::can_allocate_after_suballocation_releases(
             request.layout->page_stride > std::numeric_limits<std::size_t>::max() / request.pages) {
             return false;
         }
-        const std::size_t bytes =
+        std::size_t remaining =
             request.layout->page_stride * static_cast<std::size_t>(request.pages);
-        const auto extent =
-            std::find_if(simulated.begin(), simulated.end(),
-                         [&](const FreeExtent& free) { return free.bytes >= bytes; });
-        if (extent == simulated.end()) { return false; }
-        extent->offset += bytes;
-        extent->bytes -= bytes;
-        if (extent->bytes == 0) { simulated.erase(extent); }
+        std::size_t used_extents = 0;
+        while (remaining != 0) {
+            std::size_t largest_extent = 0;
+            for (const FreeExtent& free : simulated) {
+                largest_extent = std::max(largest_extent, free.bytes);
+            }
+            if (largest_extent == 0) {
+                std::size_t simulated_free = 0;
+                for (const FreeExtent& free : simulated) { simulated_free += free.bytes; }
+                std::fprintf(stderr,
+                             "[ARENA] placement-fail nfree=%zu largest_free=%zu this_req=%zu "
+                             "simulated_free=%zu arena_free=%zu\n",
+                             simulated.size(), largest_extent, remaining, simulated_free,
+                             free_bytes());
+                return false;
+            }
+            const std::size_t take_bytes = std::min(remaining, largest_extent);
+            const auto extent =
+                std::find_if(simulated.begin(), simulated.end(),
+                             [&](const FreeExtent& free) { return free.bytes >= take_bytes; });
+            if (extent == simulated.end()) {
+                std::size_t simulated_free = 0;
+                for (const FreeExtent& free : simulated) { simulated_free += free.bytes; }
+                std::fprintf(stderr,
+                             "[ARENA] placement-fail nfree=%zu largest_free=%zu this_req=%zu "
+                             "simulated_free=%zu arena_free=%zu\n",
+                             simulated.size(), largest_extent, take_bytes, simulated_free,
+                             free_bytes());
+                return false;
+            }
+            extent->offset += take_bytes;
+            extent->bytes -= take_bytes;
+            if (extent->bytes == 0) { simulated.erase(extent); }
+            remaining -= take_bytes;
+            ++used_extents;
+        }
+        if (used_extents > 1) { required_descriptors += used_extents - 1U; }
+    }
+    if (required_descriptors > available_descriptors) {
+        std::fprintf(stderr,
+                     "[ARENA] descriptor-short required=%zu available=%zu nalloc=%zu nrel=%zu\n",
+                     required_descriptors, available_descriptors, target_allocations.size(),
+                     proposed_releases.size());
+        return false;
     }
     return true;
 }

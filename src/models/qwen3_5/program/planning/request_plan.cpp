@@ -487,6 +487,30 @@ std::optional<AdmissionCandidate> ProgramImpl::inspect_lane(
                                                     ? runtime::PrivateSourceMode::Retain
                                                     : runtime::PrivateSourceMode::ConsumeToActive;
         if (!base.allow_prefix_reuse || !prompt.identity.reusable) { return std::nullopt; }
+        const auto private_prefix_ok = [&](const char* kind, std::size_t count) -> bool {
+            const std::size_t prompt_tokens = prompt.token_ids.size();
+            if (count > prompt_tokens || count > source->ledger.size()) {
+                if (prompt_tokens > 4096) {
+                    std::fprintf(stderr,
+                                 "[PM] kind=%s count=%zu prompt=%zu ledger=%zu size-mismatch\n",
+                                 kind, count, prompt_tokens, source->ledger.size());
+                }
+                return false;
+            }
+            const bool token_eq =
+                std::equal(prompt.token_ids.begin(),
+                           prompt.token_ids.begin() + static_cast<std::ptrdiff_t>(count),
+                           source->ledger.begin());
+            const bool identity_eq = source->prefix_identity.matches(prompt, count);
+            const bool ok          = token_eq && identity_eq;
+            if (!ok && prompt_tokens > 4096) {
+                std::fprintf(stderr,
+                             "[PM] kind=%s count=%zu prompt=%zu ledger=%zu token=%d identity=%d\n",
+                             kind, count, prompt_tokens, source->ledger.size(),
+                             static_cast<int>(token_eq), static_cast<int>(identity_eq));
+            }
+            return ok;
+        };
         if (selected.kind == runtime::CheckpointKind::SessionEndpoint) {
             if (selected.ordinal != 0) {
                 throw std::logic_error("private endpoint checkpoint ordinal is invalid");
@@ -494,10 +518,7 @@ std::optional<AdmissionCandidate> ProgramImpl::inspect_lane(
             if (selected.frontier == 0 || selected.frontier != source->execution_frontier) {
                 throw std::logic_error("catalog endpoint summary disagrees with Program state");
             }
-            if (!qwen3_5::detail::prefix_matches(prompt, source->ledger, source->prefix_identity,
-                                                 selected.frontier)) {
-                return std::nullopt;
-            }
+            if (!private_prefix_ok("endpoint", selected.frontier)) { return std::nullopt; }
             plan->reuse      = ReusePath::PrivateEndpoint;
             plan->reuse_base = selected.frontier;
         } else if (selected.kind == runtime::CheckpointKind::LongAnchor) {
@@ -510,10 +531,7 @@ std::optional<AdmissionCandidate> ProgramImpl::inspect_lane(
             if (anchor == source->long_anchors.end() || selected.frontier == 0) {
                 throw std::logic_error("catalog long-anchor summary disagrees with Program state");
             }
-            if (!qwen3_5::detail::prefix_matches(prompt, source->ledger, source->prefix_identity,
-                                                 selected.frontier)) {
-                return std::nullopt;
-            }
+            if (!private_prefix_ok("long-anchor", selected.frontier)) { return std::nullopt; }
             plan->reuse       = ReusePath::PrivateLongAnchor;
             plan->reuse_base  = selected.frontier;
             plan->source_mode = runtime::PrivateSourceMode::Retain;
@@ -527,10 +545,7 @@ std::optional<AdmissionCandidate> ProgramImpl::inspect_lane(
                 selected.frontier != source->rewrite_checkpoint.frontier) {
                 throw std::logic_error("catalog rewrite summary disagrees with Program state");
             }
-            if (!qwen3_5::detail::prefix_matches(prompt, source->ledger, source->prefix_identity,
-                                                 selected.frontier)) {
-                return std::nullopt;
-            }
+            if (!private_prefix_ok("rewrite", selected.frontier)) { return std::nullopt; }
             plan->reuse      = restore_path(source->rewrite_checkpoint.kind);
             plan->reuse_base = selected.frontier;
         }

@@ -373,7 +373,7 @@ runtime::ContextTransactionReserveStatus ProgramImpl::reserve_active_capture_imp
         (pressure_details == nullptr || pressure_details->planning_revision != resource_revision_ ||
          pressure_details->summary.prompt_tokens != assessment.frontier ||
          pressure_details->blocked_host_allocation_bytes != 0 ||
-         !physical_peak_fits(pressure_details->demand.physical_peak_additional))) {
+         !physical_peak_fits_trust_host_allocation(pressure_details->demand.physical_peak_additional))) {
         skip_capture(std::move(offer));
         return runtime::ContextTransactionReserveStatus::Aborted;
     }
@@ -955,6 +955,7 @@ ActiveCaptureResult ProgramImpl::publish_active_capture(ActiveCaptureTransaction
         shared.rebuild_work      = validated_rebuild_work(transaction.group.identity->rebuild_work,
                                                           transaction.group.frontier);
         shared.active_references = 1;
+        shared.last_hit_epoch    = next_shared_hit_epoch_++;
         sequence.shared_prefix_references.push_back(index);
         slot.role = SharedPrefixSlotRole::Catalogued;
         out.shared.emplace(SharedPrefixPublication{

@@ -57,6 +57,8 @@ public:
 
     [[nodiscard]] bool valid() const noexcept { return owner_ != nullptr; }
 
+    [[nodiscard]] std::uint32_t index() const noexcept { return index_; }
+
     [[nodiscard]] friend bool operator==(LogicalKVPageHandle,
                                          LogicalKVPageHandle) noexcept = default;
 
@@ -268,6 +270,27 @@ public:
     }
 
     [[nodiscard]] std::uint32_t occupied() const noexcept { return capacity() - free_count_; }
+
+    struct ReplicaResidencyCounts {
+        std::uint32_t device_only = 0;
+        std::uint32_t host_only   = 0;
+        std::uint32_t both        = 0;
+    };
+    [[nodiscard]] ReplicaResidencyCounts replica_residency_counts() const noexcept {
+        ReplicaResidencyCounts out;
+        for (const Page& page : pages_) {
+            const bool dev  = page.device_replica.has_value();
+            const bool host = page.host_replica.has_value();
+            if (dev && host) {
+                ++out.both;
+            } else if (dev) {
+                ++out.device_only;
+            } else if (host) {
+                ++out.host_only;
+            }
+        }
+        return out;
+    }
 
     [[nodiscard]] LogicalKVPageHandle materialize(DeviceKVPageReservation& reservation) {
         if (free_count_ == 0) {
@@ -1724,6 +1747,39 @@ public:
         Address& address = addresses_[handle.index_];
         for (std::uint32_t page = 0; page < address.page_count; ++page) {
             if (!pages_->release_reference(membership(address, page), false)) { std::terminate(); }
+            membership(address, page) = {};
+        }
+        const std::uint32_t index      = handle.index_;
+        const std::uint32_t generation = next_generation(address.generation);
+        address                        = Address{};
+        address.generation             = generation;
+        free_[free_count_++]           = index;
+        rebuild_checkpoint_protection();
+        return true;
+    }
+
+    // Closure release: drops this address space's own page references even when other
+    // address spaces (a nested dead shared-prefix chain) still reference the same pages.
+    // can_release() above is all-or-nothing over the whole space, which circularly pins
+    // every member of a nested dead chain. Per-page safety is preserved: no active row,
+    // reservation, or pinned/source-pinned page is ever released.
+    [[nodiscard]] bool can_release_passive(KVAddressSpaceHandle handle) const noexcept {
+        if (!valid(handle)) { return false; }
+        const Address& address = addresses_[handle.index_];
+        if (address.active || address.row || address.reservation.valid()) { return false; }
+        for (std::uint32_t page = 0; page < address.page_count; ++page) {
+            if (!pages_->can_release_reference(membership(address, page), false)) { return false; }
+        }
+        return true;
+    }
+
+    [[nodiscard]] bool release_passive(KVAddressSpaceHandle handle) noexcept {
+        if (!can_release_passive(handle)) { return false; }
+        Address& address = addresses_[handle.index_];
+        for (std::uint32_t page = 0; page < address.page_count; ++page) {
+            if (!pages_->release_reference(membership(address, page), false)) { std::terminate(); }
+        }
+        for (std::uint32_t page = 0; page < address.page_count; ++page) {
             membership(address, page) = {};
         }
         const std::uint32_t index      = handle.index_;

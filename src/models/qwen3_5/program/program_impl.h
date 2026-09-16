@@ -381,6 +381,11 @@ struct SharedPrefixState {
     bool tail_hidden_valid         = false;
     runtime::PrefillWork rebuild_work;
     std::uint32_t active_references = 0;
+    // Monotonic shared-prefix hit epoch of the most recent publication or reuse. The
+    // dead-closure release sweep refuses to free a shared prefix hit within the recent
+    // activity window: an unreferenced-but-recently-used prefix may be about to be
+    // re-sent, so the planner (which orders by weight then recency) decides instead.
+    std::uint64_t last_hit_epoch = 0;
 };
 
 enum class SharedPrefixSlotRole : std::uint8_t {
@@ -711,6 +716,12 @@ private:
     std::optional<PendingTransaction> pending_transaction_;
     std::uint64_t next_transaction_id_ = 1;
 
+    // Monotonic epoch advanced on every shared-prefix publication and reuse. The dead
+    // closure sweep compares it against a shared prefix's last_hit_epoch to protect
+    // recently-used unreferenced prefixes from wholesale release.
+    std::uint64_t next_shared_hit_epoch_ = 1;
+    static constexpr std::uint64_t kSharedHitActivityWindow = 32;
+
     enum class PressureTransitionPhase : std::uint8_t {
         HostReleases,
         CopyPreparation,
@@ -962,6 +973,13 @@ private:
     owner_exclusive_resources(const SharedPrefixState& shared) const;
     [[nodiscard]] detail::PhysicalResources physical_occupancy() const noexcept;
     [[nodiscard]] bool physical_peak_fits(detail::PhysicalResources peak) const noexcept;
+    // Feasibility check for a plan whose Host allocation was already validated by the
+    // arena's fragmentation-aware prediction (blocked_host_allocation_bytes == 0). The
+    // byte-model Host projection is conservative and can exceed what the allocator
+    // actually accepted by a small margin, so it must not veto such a plan; the
+    // non-Host resources are still checked against the peak.
+    [[nodiscard]] bool physical_peak_fits_trust_host_allocation(
+        detail::PhysicalResources peak) const noexcept;
     [[nodiscard]] StateImageHandle
     selected_state(const SequenceState& sequence, ReusePath reuse,
                    std::optional<runtime::CheckpointRef> checkpoint) const;
@@ -1085,6 +1103,7 @@ private:
     void release_continuation_slot_strict(std::uint32_t index) noexcept;
     void release_continuation_slot_best_effort(std::uint32_t index) noexcept;
     void retire_continuation_slot(std::uint32_t index) noexcept;
+    void release_dead_shared_prefix_closures() noexcept;
     void clear_execution_failure_lanes(std::span<const std::uint32_t> lanes) noexcept;
     [[nodiscard]] bool can_clear_lane_strict(const SequenceState& sequence) const;
     [[nodiscard]] bool clear_lane_strict(SequenceState& sequence, RequestControl& request) noexcept;
@@ -1125,6 +1144,7 @@ private:
     [[nodiscard]] detail::PhysicalResources
     release_shared_prefix_state_strict(std::uint32_t index,
                                        SharedPrefixSlotRole expected_role) noexcept;
+    void release_dead_shared_prefix_closures() noexcept;
     [[nodiscard]] detail::PhysicalResources
     install_private_capture(SequenceState& sequence, const CaptureGroup& group,
                             StateImageHandle checkpoint,
@@ -1288,7 +1308,9 @@ struct PressurePlanningSessionImpl {
     [[nodiscard]] qwen3_5::PressureTargetHandle
     identity_target(runtime::PlanningCandidateId candidate) const;
     [[nodiscard]] qwen3_5::PressureTargetHandle
-    root_maximal_target(runtime::PlanningCandidateId root_candidate);
+    root_maximal_target(runtime::PlanningCandidateId root_candidate,
+                        std::span<const runtime::PlanningOwnerId> preferred_owner_ids,
+                        std::span<const std::uint32_t> preferred_owner_weights);
     [[nodiscard]] qwen3_5::PressureTargetHandle
     maximal_target(runtime::PlanningCandidateId candidate);
     [[nodiscard]] qwen3_5::PressureConstructionCursor

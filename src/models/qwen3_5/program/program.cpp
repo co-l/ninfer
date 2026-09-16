@@ -125,9 +125,12 @@ PressurePlanningSession::identity_target(runtime::PlanningCandidateId candidate)
 }
 
 PressureTargetHandle
-PressurePlanningSession::root_maximal_target(runtime::PlanningCandidateId root_candidate) {
+PressurePlanningSession::root_maximal_target(
+    runtime::PlanningCandidateId root_candidate,
+    std::span<const runtime::PlanningOwnerId> preferred_owner_ids,
+    std::span<const std::uint32_t> preferred_owner_weights) {
     if (impl_ == nullptr) { throw std::logic_error("pressure planning session is empty"); }
-    return impl_->root_maximal_target(root_candidate);
+    return impl_->root_maximal_target(root_candidate, preferred_owner_ids, preferred_owner_weights);
 }
 
 PressureTargetHandle

@@ -591,7 +591,13 @@ void ProgramImpl::prepare_consumed_source(MaterializationTransaction& transactio
     } else if (is_masked_draft_backend(speculative_backend)) {
         source.dflash_context_frontier = details.reuse_base;
     }
-    if (host_kv_extents) { (void)host_kv_extents->release_unreferenced(); }
+    if (host_kv_extents) {
+        const std::size_t freed = host_kv_extents->release_unreferenced();
+        if (freed != 0) {
+            std::fprintf(stderr, "[ORPHAN] freed=%zu bytes occ=%zu\n", freed,
+                         static_cast<std::size_t>(host_kv_extents->arena_occupied_bytes()));
+        }
+    }
     refresh_state_views(source);
 
     const detail::PhysicalResources after   = owner_exclusive_resources(source);
@@ -1556,8 +1562,21 @@ void ProgramImpl::prepare_pressure_work(MaterializationTransaction::PressureWork
             throw std::logic_error("pressure KV source backing was not prepared");
         }
         host_kv_extents->device_sources(*reserved, change.sources);
-        pages.physical_pool().copy_to_host(
-            change.sources, host_kv_extents->writable_view(*reserved), device.transfer_stream);
+        {
+            const std::size_t extent_count = host_kv_extents->extent_count(*reserved);
+            std::size_t base               = 0;
+            for (std::size_t extent_index = 0; extent_index < extent_count; ++extent_index) {
+                HostKVAllocationView view =
+                    host_kv_extents->writable_view_at(*reserved, extent_index);
+                const std::uint32_t extent_pages = view.page_count();
+                if (base + extent_pages > change.sources.size()) { std::terminate(); }
+                pages.physical_pool().copy_to_host(
+                    std::span<const DeviceKVPageHandle>(change.sources.data() + base,
+                                                        extent_pages),
+                    view, device.transfer_stream);
+                base += extent_pages;
+            }
+        }
         change.backup.emplace(std::move(*reserved));
     };
     const SequenceKVBundle* kv = sequence != nullptr ? (sequence->kv ? &*sequence->kv : nullptr)
@@ -2095,6 +2114,10 @@ ProgramImpl::progress_materialization_transaction(runtime::CancellationFlagView 
         }
         pressure_transition.timer_mask = 0;
         pressure_transition.phase      = PressureTransitionPhase::Committed;
+        // Pressure commits change the Host arena and victim residency. Concurrent
+        // in-flight plans dry-run against a stale snapshot and can over-credit the
+        // same releases; invalidate them so they re-plan against the committed state.
+        advance_resource_revision();
         if (cancellation.requested()) { transaction.cancel_pending = true; }
         if (transaction.cancel_pending) {
             abort_transaction();

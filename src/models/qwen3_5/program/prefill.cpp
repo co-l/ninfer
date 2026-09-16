@@ -389,7 +389,13 @@ void ProgramImpl::start_sequence(std::uint32_t lane, SequenceState& sequence,
                 backend_kv_addresses->destructive_truncate_inactive(
                     *sequence.kv->backend, *transaction.backend_activation_frontier);
             }
-            if (host_kv_extents) { (void)host_kv_extents->release_unreferenced(); }
+            if (host_kv_extents) {
+                const std::size_t freed = host_kv_extents->release_unreferenced();
+                if (freed != 0) {
+                    std::fprintf(stderr, "[ORPHAN] freed=%zu bytes occ=%zu\n", freed,
+                                 static_cast<std::size_t>(host_kv_extents->arena_occupied_bytes()));
+                }
+            }
         }
         if ((text_prefix_fork || backend_prefix_fork) && !transaction.prefix_forks_ready) {
             throw std::logic_error("materialization prefix forks are incomplete");
@@ -527,6 +533,7 @@ void ProgramImpl::start_sequence(std::uint32_t lane, SequenceState& sequence,
                     throw std::overflow_error("shared-prefix active reference overflow");
                 }
                 ++shared_source->active_references;
+                shared_source->last_hit_epoch = next_shared_hit_epoch_++;
                 sequence.shared_prefix_references.push_back(transaction.shared_source_index);
             }
             refresh_state_views(sequence);

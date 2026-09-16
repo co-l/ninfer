@@ -306,7 +306,9 @@ bool ProgramImpl::pressure_checkpoint_recovery_impacts(
 
     for (std::size_t index = 0; index < private_owners.size(); ++index) {
         const ContinuationHandle* handle = private_owners[index];
-        if (handle == nullptr || !valid_continuation(*handle)) { return false; }
+        if (handle == nullptr || !valid_continuation(*handle)) {
+            return false;
+        }
         const SequenceState& sequence = continuation_states[ContractAccess::index(*handle)];
         projected_owners.push_back(OwnerProjection{
             .sequence = &sequence,
@@ -765,7 +767,13 @@ void ProgramImpl::publish_checkpoint_drop(SequenceState& sequence,
     } else if (is_masked_draft_backend(speculative_backend)) {
         sequence.dflash_context_frontier = retained->main_frontier;
     }
-    if (host_kv_extents) { (void)host_kv_extents->release_unreferenced(); }
+    if (host_kv_extents) {
+        const std::size_t freed = host_kv_extents->release_unreferenced();
+        if (freed != 0) {
+            std::fprintf(stderr, "[ORPHAN] freed=%zu bytes occ=%zu\n", freed,
+                         static_cast<std::size_t>(host_kv_extents->arena_occupied_bytes()));
+        }
+    }
     refresh_state_views(sequence);
 }
 

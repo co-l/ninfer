@@ -209,6 +209,12 @@ public:
         return capacity_bytes_ - occupied_bytes_;
     }
 
+    [[nodiscard]] std::size_t largest_free_extent() const noexcept {
+        std::size_t largest = 0;
+        for (const FreeExtent& extent : free_extents_) { largest = std::max(largest, extent.bytes); }
+        return largest;
+    }
+
     [[nodiscard]] const HostKVPageLayout* layout_for(const KVPageGeometry& geometry) const noexcept;
 
     [[nodiscard]] bool can_allocate(const HostKVPageLayout& layout,

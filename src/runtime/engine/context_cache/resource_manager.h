@@ -345,6 +345,13 @@ public:
                         program.inspect_admission(prompt, base, *destination, &*entry.handle,
                                                   nullptr, index.checkpoint, retain);
                     if (!plan) {
+                        if (base.summary().prompt_tokens > 4096) {
+                            std::fprintf(stderr,
+                                         "[REJ] private slot=%u id=%llu prompt=%u\n",
+                                         index.slot,
+                                         static_cast<unsigned long long>(entry.id),
+                                         base.summary().prompt_tokens);
+                        }
                         continue;
                     }
                     if (plan->summary().reusable_prompt_tokens == 0 ||
@@ -405,6 +412,13 @@ public:
             plan_materialization(program, prompt, base, *destination, candidates, publication_order,
                                  planning_started, provisional_demand, allowance);
         if (!selected) { return {.readiness = Readiness::TemporarilyBlocked}; }
+        if (base.summary().prompt_tokens > 4096) {
+            const RequestPlanSummary& summary = selected->summary();
+            std::fprintf(stderr,
+                         "[SEL] prompt=%u reuse=%d reusable=%u candidates=%zu\n",
+                         base.summary().prompt_tokens, static_cast<int>(summary.prefix_reuse_path),
+                         summary.reusable_prompt_tokens, candidates.size());
+        }
         return {
             .readiness = selected->needs_transfer() ? Readiness::NeedsTransfer : Readiness::Ready,
             .choice    = std::move(selected),
@@ -1754,7 +1768,16 @@ private:
         };
         for (std::uint32_t slot = 0; slot < catalog_count_; ++slot) {
             const CatalogEntry& entry = catalog_[slot];
-            if (entry.state != CatalogState::Catalogued || !entry.handle) { continue; }
+            if (entry.state != CatalogState::Catalogued || !entry.handle) {
+                if (entry.handle) {
+                    std::fprintf(stderr,
+                                 "[STK] private slot=%u id=%llu rev=%llu state=%d handle=1\n",
+                                 slot, static_cast<unsigned long long>(entry.id),
+                                 static_cast<unsigned long long>(entry.revision),
+                                 static_cast<int>(entry.state));
+                }
+                continue;
+            }
             if (entry.summary.endpoint) {
                 append(false, slot, entry.id, entry.revision, *entry.summary.endpoint);
             }
@@ -2764,6 +2787,13 @@ private:
         const std::uint32_t dropped =
             dropped_checkpoint_count(entry.summary, result.final_summary, result.disposition);
         if (result.disposition == VictimDisposition::Evicted) {
+            std::fprintf(stderr,
+                         "[ADOPT] private EVICT owner=%llu slot=%u end=%u rew=%u\n",
+                         static_cast<unsigned long long>(claim.capability.owner.id), slot,
+                         entry.summary.endpoint ? entry.summary.endpoint->required_kv.main_frontier
+                                                : 0U,
+                         entry.summary.rewrite ? entry.summary.rewrite->required_kv.main_frontier
+                                               : 0U);
             erase_session_if_owner(claim.capability.owner.id);
             clear_catalog_entry(entry);
             saturating_increment(context_stats_.pressure_private_owners_evicted);
@@ -2774,6 +2804,12 @@ private:
             entry.state = CatalogState::Catalogued;
             return;
         }
+        std::fprintf(stderr,
+                     "[ADOPT] private RETAIN owner=%llu slot=%u end=%u rew=%u committed=1\n",
+                     static_cast<unsigned long long>(claim.capability.owner.id), slot,
+                     entry.summary.endpoint ? entry.summary.endpoint->required_kv.main_frontier
+                                            : 0U,
+                     entry.summary.rewrite ? entry.summary.rewrite->required_kv.main_frontier : 0U);
         assign_continuation_summary(entry.summary, *result.final_summary);
         migrate_observations(entry, *result.final_summary, entry.retention);
         advance_revision(entry.revision);
