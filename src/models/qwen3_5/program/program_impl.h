@@ -958,8 +958,10 @@ private:
         std::span<const std::optional<std::uint32_t>> prefix_execution_splits,
         runtime::ExecutionTiming* failed_timing);
     [[nodiscard]] bool valid_sequence(SequenceHandle handle) const noexcept;
+public:
     [[nodiscard]] bool valid_continuation(const ContinuationHandle& handle) const noexcept;
     [[nodiscard]] bool valid_shared_prefix(const SharedPrefixHandle& handle) const noexcept;
+private:
     [[nodiscard]] bool valid_capture_offer(const CaptureOffer& offer) const noexcept;
     [[nodiscard]] bool materialization_pins(std::uint32_t index,
                                             std::uint64_t generation) const noexcept;

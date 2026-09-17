@@ -332,9 +332,13 @@ public:
                 }
 
                 if (!index.shared) {
-                    const CatalogEntry& entry = catalog_[index.slot];
+                    CatalogEntry& entry = catalog_[index.slot];
                     if (entry.state != CatalogState::Catalogued || !entry.handle ||
                         private_has_active_edge(index.slot)) {
+                        continue;
+                    }
+                    if (!program.valid_continuation(*entry.handle)) {
+                        clear_catalog_entry(entry);
                         continue;
                     }
                     const bool retain =
@@ -382,8 +386,12 @@ public:
                     continue;
                 }
 
-                const SharedCatalogEntry& entry = shared_catalog_[index.slot];
+                SharedCatalogEntry& entry = shared_catalog_[index.slot];
                 if (entry.state != SharedCatalogState::Catalogued || !entry.handle) { continue; }
+                if (!program.valid_shared_prefix(*entry.handle)) {
+                    clear_shared_entry(entry);
+                    continue;
+                }
                 std::optional<AdmissionCandidate> plan = program.inspect_admission(
                     prompt, base, *destination, nullptr, &*entry.handle, index.checkpoint, false);
                 if (!plan) { continue; }
@@ -685,9 +693,13 @@ public:
                 });
             };
             for (std::uint32_t slot = 0; slot < catalog_count_; ++slot) {
-                const CatalogEntry& entry = catalog_[slot];
+                CatalogEntry& entry = catalog_[slot];
                 if (entry.state != CatalogState::Catalogued || !entry.handle ||
                     private_has_active_edge(slot)) {
+                    continue;
+                }
+                if (!program.valid_continuation(*entry.handle)) {
+                    clear_catalog_entry(entry);
                     continue;
                 }
                 const PlanningOwnerId owner{
@@ -720,8 +732,12 @@ public:
                 }
             }
             for (std::uint32_t slot = 0; slot < shared_catalog_count_; ++slot) {
-                const SharedCatalogEntry& entry = shared_catalog_[slot];
+                SharedCatalogEntry& entry = shared_catalog_[slot];
                 if (entry.state != SharedCatalogState::Catalogued || !entry.handle) { continue; }
+                if (!program.valid_shared_prefix(*entry.handle)) {
+                    clear_shared_entry(entry);
+                    continue;
+                }
                 const PlanningOwnerId owner{
                     .value = static_cast<std::uint32_t>(capture_owner_records.size())};
                 capture_owner_records.push_back(PlanningOwnerRecord{
@@ -1921,6 +1937,7 @@ private:
                  slot == selected_candidate.private_source->slot)) {
                 continue;
             }
+            if (!program.valid_continuation(*entry.handle)) { continue; }
             const PlanningOwnerId owner{.value = next_projected_owner++};
             projected_owners.push_back(ContextPortfolioOwnerPolicy{
                 .owner                    = owner,
@@ -1939,6 +1956,7 @@ private:
         for (std::uint32_t slot = 0; slot < shared_catalog_count_; ++slot) {
             const SharedCatalogEntry& entry = shared_catalog_[slot];
             if (entry.state != SharedCatalogState::Catalogued || !entry.handle) { continue; }
+            if (!program.valid_shared_prefix(*entry.handle)) { continue; }
             const PlanningOwnerId owner{.value = next_projected_owner++};
             projected_owners.push_back(ContextPortfolioOwnerPolicy{
                 .owner                  = owner,
@@ -2059,9 +2077,13 @@ private:
             checkpoint_policies.reserve(prefix_index_.size());
 
             for (std::uint32_t slot = 0; slot < catalog_count_; ++slot) {
-                const CatalogEntry& entry = catalog_[slot];
+                CatalogEntry& entry = catalog_[slot];
                 if (entry.state != CatalogState::Catalogued || !entry.handle ||
                     private_has_active_edge(slot)) {
+                    continue;
+                }
+                if (!program.valid_continuation(*entry.handle)) {
+                    clear_catalog_entry(entry);
                     continue;
                 }
                 const PlanningOwnerId owner{.value =
@@ -2117,9 +2139,13 @@ private:
                 });
             }
             for (std::uint32_t slot = 0; slot < shared_catalog_count_; ++slot) {
-                const SharedCatalogEntry& entry = shared_catalog_[slot];
+                SharedCatalogEntry& entry = shared_catalog_[slot];
                 if (entry.state != SharedCatalogState::Catalogued || !entry.handle ||
                     entry.transaction_pins != 0 || shared_active_edge_count(slot) != 0) {
+                    continue;
+                }
+                if (!program.valid_shared_prefix(*entry.handle)) {
+                    clear_shared_entry(entry);
                     continue;
                 }
                 const PlanningOwnerId owner{.value =

@@ -906,6 +906,8 @@ public:
     [[nodiscard]] std::vector<runtime::CheckpointRecoveryAlternativeWork>
     checkpoint_recovery_work(const SharedPrefixHandle& owner,
                              runtime::CheckpointRef checkpoint) const;
+    [[nodiscard]] bool valid_continuation(const ContinuationHandle& owner) const noexcept;
+    [[nodiscard]] bool valid_shared_prefix(const SharedPrefixHandle& owner) const noexcept;
     [[nodiscard]] CapturePressurePlanningSession
     begin_capture_pressure_planning(const CaptureAssessment& assessment,
                                     std::span<const ContinuationHandle* const> private_owners,

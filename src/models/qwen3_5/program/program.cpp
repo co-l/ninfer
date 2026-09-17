@@ -414,6 +414,14 @@ bool Program::shared_capture_matches(const CaptureOffer& offer,
     return impl_->shared_capture_matches(offer, shared);
 }
 
+bool Program::valid_continuation(const ContinuationHandle& owner) const noexcept {
+    return impl_->valid_continuation(owner);
+}
+
+bool Program::valid_shared_prefix(const SharedPrefixHandle& owner) const noexcept {
+    return impl_->valid_shared_prefix(owner);
+}
+
 void Program::skip_capture(CaptureOffer&& offer) { impl_->skip_capture(std::move(offer)); }
 
 runtime::ContextTransactionReserveStatus
