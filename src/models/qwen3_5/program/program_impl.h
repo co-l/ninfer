@@ -1111,7 +1111,7 @@ private:
     [[nodiscard]] bool clear_lane_strict(SequenceState& sequence, RequestControl& request) noexcept;
     [[nodiscard]] std::optional<ContinuationHandle> retain_active_sequence_as_continuation(
         std::uint32_t lane, RequestControl& request, SequenceState& state,
-        qwen3_6::ContinuationSummary& summary) noexcept;
+        qwen3_5::ContinuationSummary& summary) noexcept;
     void clear_lane_best_effort(SequenceState& sequence, RequestControl& request) noexcept;
     void ordered_reset(SequenceState& sequence);
     [[nodiscard]] StateImageSelectors state_selectors(const SequenceState& sequence) const;

@@ -113,8 +113,10 @@ struct FakeShortlistKey {
 };
 
 struct FakeRequiredKV {
-    std::uint32_t main_pages    = 1;
-    std::uint32_t backend_pages = 0;
+    std::uint32_t main_frontier    = 0;
+    std::uint32_t backend_frontier = 0;
+    std::uint32_t main_pages       = 1;
+    std::uint32_t backend_pages    = 0;
 
     friend bool operator==(FakeRequiredKV, FakeRequiredKV) = default;
 };
@@ -558,7 +560,10 @@ public:
         return PlanningCandidateId{.value = 0};
     }
 
-    [[nodiscard]] FakePressureTargetHandle root_maximal_target(PlanningCandidateId candidate);
+    [[nodiscard]] FakePressureTargetHandle
+    root_maximal_target(PlanningCandidateId candidate,
+                        std::span<const PlanningOwnerId> preferred_owner_ids,
+                        std::span<const std::uint32_t> preferred_owner_weights);
     struct Cursor;
     [[nodiscard]] FakePressureTargetHandle maximal_target(PlanningCandidateId candidate);
     [[nodiscard]] std::optional<FakePressureTargetHandle>
@@ -655,6 +660,14 @@ public:
 
     [[nodiscard]] bool isolated_request_feasible(const FakeRequestBasePlan& base) const noexcept {
         return base.isolated_feasible;
+    }
+
+    [[nodiscard]] bool valid_continuation(const FakeContinuationHandle&) const noexcept {
+        return true;
+    }
+
+    [[nodiscard]] bool valid_shared_prefix(const FakeSharedPrefixHandle&) const noexcept {
+        return true;
     }
 
     [[nodiscard]] std::optional<FakeAdmissionCandidate>
@@ -1338,7 +1351,9 @@ FakePressureTargetHandle FakePressurePlanningSession::identity_target() const {
 }
 
 FakePressureTargetHandle
-FakePressurePlanningSession::root_maximal_target(PlanningCandidateId candidate) {
+FakePressurePlanningSession::root_maximal_target(
+    PlanningCandidateId candidate, std::span<const PlanningOwnerId> preferred_owner_ids,
+    std::span<const std::uint32_t> preferred_owner_weights) {
     const std::uint32_t selected = candidate_index(candidate);
     populate_options(selected);
     Target maximal{
@@ -1368,7 +1383,7 @@ FakePressurePlanningSession::root_maximal_target(PlanningCandidateId candidate) 
 
 FakePressureTargetHandle
 FakePressurePlanningSession::maximal_target(PlanningCandidateId candidate) {
-    const auto target                   = root_maximal_target(candidate);
+    const auto target                   = root_maximal_target(candidate, {}, {});
     targets_[target.index].root_maximal = false;
     return target;
 }

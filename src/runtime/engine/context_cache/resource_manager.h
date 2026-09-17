@@ -544,7 +544,7 @@ public:
         }
         if (!victim) { return false; }
         CatalogEntry& entry                 = catalog_[*victim];
-        const typename Package::ReleaseResult result =
+        const typename ModelContract::ReleaseResult result =
             program.release_continuation(std::move(*entry.handle));
         if (result.status != ConsumeStatus::Consumed) { return false; }
         erase_session_if_owner(entry.id);

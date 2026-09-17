@@ -1355,7 +1355,7 @@ PressurePlanningSessionImpl::deterministic_target(
             const auto tr = program->text_kv_pages->replica_residency_counts();
             const auto br = program->backend_kv_pages != nullptr
                                 ? program->backend_kv_pages->replica_residency_counts()
-                                : qwen3_6::detail::LogicalKVPageStore::ReplicaResidencyCounts{};
+                                : qwen3_5::detail::LogicalKVPageStore::ReplicaResidencyCounts{};
             std::fprintf(stderr, "[PP] resid t(d=%u,h=%u,b=%u) k(d=%u,h=%u,b=%u) host=%zu\n",
                          tr.device_only, tr.host_only, tr.both, br.device_only, br.host_only,
                          br.both, static_cast<std::size_t>(program->physical_occupancy().host.kv_bytes));
@@ -2188,11 +2188,11 @@ PressurePlanningSessionImpl::assess(qwen3_5::PressureTargetHandle target) {
                 const auto text_res =
                     program->text_kv_pages != nullptr
                         ? program->text_kv_pages->replica_residency_counts()
-                        : qwen3_6::detail::LogicalKVPageStore::ReplicaResidencyCounts{};
+                        : qwen3_5::detail::LogicalKVPageStore::ReplicaResidencyCounts{};
                 const auto back_res =
                     program->backend_kv_pages != nullptr
                         ? program->backend_kv_pages->replica_residency_counts()
-                        : qwen3_6::detail::LogicalKVPageStore::ReplicaResidencyCounts{};
+                        : qwen3_5::detail::LogicalKVPageStore::ReplicaResidencyCounts{};
                 std::fprintf(
                     stderr,
                     "[AS] INFEASIBLE cand=%u blocked=%zu peak_main=%u occ_main=%u lim_main=%u "
