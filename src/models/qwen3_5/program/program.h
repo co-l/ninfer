@@ -843,7 +843,7 @@ struct AbortResult {
     GenerationTimings timings;
     SpeculativeStats speculative;
     ContinuationSummary summary;
-    std::optional<ContinuationHandle<Variant>> continuation;
+    std::optional<ContinuationHandle> continuation;
 };
 
 struct ReleaseResult {

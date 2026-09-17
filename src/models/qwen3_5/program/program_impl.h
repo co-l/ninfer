@@ -545,9 +545,6 @@ public:
     [[nodiscard]] DiscardResult abort_pending(PendingBatch&& pending) noexcept;
     [[nodiscard]] FinishResult finish(SequenceHandle sequence) noexcept;
     [[nodiscard]] AbortResult abort(SequenceHandle sequence) noexcept;
-    [[nodiscard]] std::optional<ContinuationHandle> retain_active_sequence_as_continuation(
-        std::uint32_t lane, RequestControl& request, SequenceState& state,
-        qwen3_5::ContinuationSummary& summary) noexcept;
     [[nodiscard]] ReleaseResult release_continuation(ContinuationHandle&& continuation) noexcept;
     [[nodiscard]] ReleaseResult release_shared_prefix(SharedPrefixHandle&& shared) noexcept;
     void fail_all_cleanup() noexcept;
@@ -1146,7 +1143,6 @@ private:
     [[nodiscard]] detail::PhysicalResources
     release_shared_prefix_state_strict(std::uint32_t index,
                                        SharedPrefixSlotRole expected_role) noexcept;
-    void release_dead_shared_prefix_closures() noexcept;
     [[nodiscard]] detail::PhysicalResources
     install_private_capture(SequenceState& sequence, const CaptureGroup& group,
                             StateImageHandle checkpoint,

@@ -245,7 +245,8 @@ void test_kv_store(ninfer::DeviceContext& device) {
     expect(!pages.host_resident(logical_pages[0]) && !pages.host_resident(logical_pages[1]),
            "incomplete KV D2H does not publish Host replicas");
     CUDA_CHECK(cudaStreamSynchronize(device.transfer_stream));
-    auto host_extent = extents.publish(std::move(*host_backup));
+    extents.publish(std::move(*host_backup));
+    const auto host_extent = pages.host_replica(logical_pages[0]).extent;
     expect(pages.host_resident(logical_pages[0]) && pages.host_resident(logical_pages[1]),
            "KV extent publication attaches every logical Host replica");
     const std::array first_host_release{logical_pages[0]};
@@ -269,7 +270,8 @@ void test_kv_store(ninfer::DeviceContext& device) {
     physical_pages.copy_to_host(second_sources, extents.writable_view(*second_host_backup),
                                 device.transfer_stream);
     CUDA_CHECK(cudaStreamSynchronize(device.transfer_stream));
-    const auto second_host_extent = extents.publish(std::move(*second_host_backup));
+    extents.publish(std::move(*second_host_backup));
+    const auto second_host_extent = pages.host_replica(logical_pages[1]).extent;
     expect(pages.drop_device_replica(logical_pages[0]) &&
                pages.drop_device_replica(logical_pages[1]) && !extents.release(second_host_extent),
            "Host-only KV pages remain valid and cannot lose their last replica");
@@ -405,7 +407,8 @@ void test_kv_store(ninfer::DeviceContext& device) {
     physical_pages.copy_to_host(alternating_sources, extents.writable_view(*alternating_backup),
                                 device.transfer_stream);
     CUDA_CHECK(cudaStreamSynchronize(device.transfer_stream));
-    const auto alternating_extent = extents.publish(std::move(*alternating_backup));
+    extents.publish(std::move(*alternating_backup));
+    const auto alternating_extent = pages.host_replica(alternating_pages[0]).extent;
     const std::array alternating_release{alternating_pages[0], alternating_pages[2]};
     expect(extents.release_page_replicas(pages, alternating_release),
            "alternating Host page release transaction");

@@ -669,7 +669,7 @@ std::optional<qwen3_5::PressureTargetHandle> PressurePlanningSessionImpl::constr
     return result;
 }
 
-inline std::optional<qwen3_5::PressureTargetHandle>
+std::optional<qwen3_5::PressureTargetHandle>
 PressurePlanningSessionImpl::graceful_fallback_target(
     runtime::PlanningCandidateId admission,
     std::span<const runtime::PlanningOwnerId> preferred_owner_ids) {
@@ -788,7 +788,7 @@ PressurePlanningSessionImpl::graceful_fallback_target(
     return handle;
 }
 
-inline std::optional<qwen3_5::PressureTargetHandle>
+std::optional<qwen3_5::PressureTargetHandle>
 PressurePlanningSessionImpl::deterministic_target(
     runtime::PlanningCandidateId admission,
     std::span<const runtime::PlanningOwnerId> preferred_owner_ids,
