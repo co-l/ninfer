@@ -182,8 +182,8 @@ govern a live decision in the current task.
 These boundaries govern ordinary implementation work. An explicit architecture task may revise
 them, but must update the corresponding active authorities and affected implementation together.
 
-- `.ninfer` is the only C++ product artifact. Do not add extension detection, compatibility shims,
-  or a second product lane.
+- v3 `.ninfer` is the only C++ product artifact. Do not add extension detection, compatibility shims,
+  or a second product lane. Legacy v2 files are converted by `tools/upgrade_ninfer_v2_to_v3.py`.
 - `include/ninfer/engine.h` and `include/ninfer/types.h` are the opaque Engine interface used by
   in-tree applications and owning host values. NInfer does not currently install or export a C++
   SDK. `include/ninfer/ops/` contains repository-internal semantic Op contracts.
@@ -194,7 +194,7 @@ them, but must update the corresponding active authorities and affected implemen
 - `src/ops` owns every semantically closed Op implementation, including fused, fixed-shape, and
   device-specialized paths. Op ownership follows the mathematical or state-transition contract,
   not its first model caller or demonstrated cross-target reuse.
-- `src/targets/qwen3_6` owns only the Qwen3.6-family invariants shared by the 27B and 35B-A3B
+- `src/models/qwen3_5` owns only the Qwen3.6-family invariants shared by the 27B and 35B-A3B
   targets: tokenizer/template and output semantics, media preprocessing and MRoPE prompt
   construction, owning prepared-prompt/output-session types, semantic weight-view schemas, passive
   Vision definitions, and the fixed
@@ -313,7 +313,7 @@ These are conventional project resources, not a checklist of resources every tas
 | repository | current checkout |
 | Python 3.11 | `python3` in the selected maintainer environment |
 | BF16 source checkpoint | explicit local checkpoint directory |
-| product artifact | `out/qwen3_6_27b.ninfer` |
+| product artifact | `out/qwen3_6_27b.ninfer` (v3; legacy v2 files go through `tools/upgrade_ninfer_v2_to_v3.py`) |
 | conversion report | `out/qwen3_6_27b.ninfer.conversion.json` |
 | normal build | `build/` |
 | profiler output | `profiles/ncu/`, `profiles/nsys/`, `profiles/bench/` |
