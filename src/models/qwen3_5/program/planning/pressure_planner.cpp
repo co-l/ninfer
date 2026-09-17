@@ -844,8 +844,6 @@ PressurePlanningSessionImpl::deterministic_target(
                                         std::optional<std::size_t> override_owner,
                                         const PressureDecision* override_decision) {
         detail::PhysicalDelta pressure;
-        std::vector<std::uint32_t> demote_main;
-        std::vector<std::uint32_t> demote_back;
         for (std::size_t index = 0; index < options.victims.size(); ++index) {
             const PressureDecision* decision = nullptr;
             if (override_owner && *override_owner == index) {
@@ -864,33 +862,17 @@ PressurePlanningSessionImpl::deterministic_target(
                 pressure.added, decision->effect.added);
             pressure.removed = planning_resource_sum(
                 pressure.removed, decision->effect.removed);
-            for (const PressureKVDecision& kv : decision->main_kv_changes) {
-                if (kv.kind == PressureKVDecisionKind::DemoteToHost && kv.page_count != 0) {
-                    demote_main.push_back(kv.page_count);
-                }
-            }
-            for (const PressureKVDecision& kv : decision->backend_kv_changes) {
-                if (kv.kind == PressureKVDecisionKind::DemoteToHost && kv.page_count != 0) {
-                    demote_back.push_back(kv.page_count);
-                }
-            }
         }
         detail::PhysicalResources residual =
             program->guided_materialization_deficit(candidate, pressure);
-        // The plan's demotes add Host KV that compose_pressure_candidate must actually
-        // allocate in the Host extent arena, whose free space can be fragmented (the
-        // byte-total model above is optimistic). Ask the allocator: if the demote
-        // requests fit the current free extents, the byte model stands; otherwise the
-        // unpaid Host addition (demoted minus freed-by-DropHostDuplicate) becomes Host
-        // pressure so Phase 2 pays it by dropping Host duplicates of low-value shared
-        // prefixes — demote without eviction, reprocessing nothing.
-        const std::uint64_t added_host_kv = pressure.added.host.kv_bytes;
-        const std::uint64_t freed_host_kv = pressure.removed.host.kv_bytes;
-        // The admission's blocked bytes are all-or-nothing (the arena cannot serve the
-        // whole demote set as-is), but the tier still has free space. Charge only the
-        // true shortfall: requested minus the currently free Host bytes minus anything
-        // this plan already frees. Otherwise Phase 2 would over-evict (targeting the
-        // full demote instead of the few stale contexts that actually cover the gap).
+        // Host pressure from the plan's own demote demand is the deterministic
+        // shortfall (demoted minus freed-by-DropHostDuplicate minus the tier's free
+        // space). The real allocator answer (host_kv_requests_fit) is verified once on
+        // the composed plan in Phase 4, which converts any demote the arena cannot
+        // place into an eviction. Simulating the arena here — once per candidate of
+        // every step — ran ~20K real allocation simulations per plan and never changed
+        // the residual (the fitted/unfitted branches assigned the identical value), so
+        // it was pure overhead.
         const detail::PhysicalResources host_occupancy = program->physical_occupancy();
         const std::uint64_t host_capacity_bytes =
             program->admission_capacity().host.kv_bytes;
@@ -899,54 +881,12 @@ PressurePlanningSessionImpl::deterministic_target(
                 ? host_capacity_bytes - host_occupancy.host.kv_bytes
                 : 0;
         const std::uint64_t host_shortfall =
-            added_host_kv > freed_host_kv + host_free_bytes
-                ? added_host_kv - freed_host_kv - host_free_bytes
+            pressure.added.host.kv_bytes >
+                    pressure.removed.host.kv_bytes + host_free_bytes
+                ? pressure.added.host.kv_bytes -
+                      pressure.removed.host.kv_bytes - host_free_bytes
                 : 0;
-        // The byte model above over-credits Host frees the hot tier never lets go
-        // of (host copies are kept, so compose's real allocator can reject a demote
-        // set the model considers free — run 44: 2.79 GiB requested vs 2.48 GiB free,
-        // residual host=0). Ask the allocator directly: if the plan's demotes don't
-        // fit the current free extents, surface the true Host demand as pressure so
-        // Phase 3 converts demotes to evictions (zero Host demand) instead of
-        // compose failing the whole plan and falling back to a root re-prefill.
-        bool host_fits            = true;
-        bool allocator_fits       = false;
-        bool deterministic_cover  = false;
-        if (added_host_kv != 0) {
-            // The conservative allocator answer (no releases) is safe but blind to the
-            // Host this plan itself frees by eviction or DropHostDuplicate — and both
-            // are deterministic at compose (a destroyed victim's Host extents, or the
-            // release of a device+Host duplicate). At high Host occupancy that blind
-            // spot wrongly blocks a relief plan and the planner falls back to a root
-            // re-prefill. Accept when the real allocator fits OR the plan's own
-            // deterministic Host frees cover the demote demand.
-            allocator_fits = program->host_kv_requests_fit(demote_main, demote_back);
-            deterministic_cover = added_host_kv <= host_free_bytes + freed_host_kv;
-            host_fits = allocator_fits || deterministic_cover;
-        }
-        // Host pressure when the plan does not fit is the deterministic shortfall: the
-        // demote demand minus what the plan's own deterministic Host frees (evictions
-        // and DropHostDuplicate) already free minus the tier's free space. Charging the
-        // full demand here (all-or-nothing) hid partial relief — chained small frees
-        // could never accumulate in the residual key, so the planner jumped straight to
-        // a single big victim (a live main) instead of chaining dead-weight relief.
-        // DropHostDuplicate is credited here too: the probe data shows device+Host
-        // duplicates are real (hundreds of pages per victim), and dropping them frees
-        // Host without touching a live context.
-        const std::uint64_t host_det_shortfall =
-            added_host_kv > freed_host_kv + host_free_bytes
-                ? added_host_kv - freed_host_kv - host_free_bytes
-                : 0;
-        if (host_fits) {
-            residual.host.kv_bytes = std::max(residual.host.kv_bytes, host_shortfall);
-        } else {
-            residual.host.kv_bytes = std::max(residual.host.kv_bytes, host_det_shortfall);
-        }
-        std::fprintf(stderr,
-                     "[PP] hostfit add=%zu free=%zu short=%zu det=%zu alloc=%d evcover=%d fits=%d\n",
-                     added_host_kv, host_free_bytes, host_shortfall, host_det_shortfall,
-                     allocator_fits ? 1 : 0, deterministic_cover ? 1 : 0,
-                     host_fits ? 1 : 0);
+        residual.host.kv_bytes = std::max(residual.host.kv_bytes, host_shortfall);
         return residual;
     };
     const detail::PhysicalResources capacity = program->admission_capacity();
@@ -1086,29 +1026,37 @@ PressurePlanningSessionImpl::deterministic_target(
                collect(program->backend_kv_addresses, program->backend_kv_pages, back_address,
                        decision.backend_kv_changes, back_targets);
     };
+    // Sorted union of every victim's committed pages, rebuilt once per planning step.
+    // The page-disjointness invariant (a committed page belongs to at most one victim)
+    // lets an overlap test against the union with a self-set skip reproduce the exact
+    // "other victims only" semantics of the per-victim scan — in O(log n) per candidate
+    // page instead of a linear scan over every other victim's page list.
+    std::vector<std::uint32_t> committed_pages;
+    const auto rebuild_committed = [&]() {
+        committed_pages.clear();
+        for (const std::vector<std::uint32_t>& pages : victim_pages) {
+            committed_pages.insert(committed_pages.end(), pages.begin(), pages.end());
+        }
+        std::sort(committed_pages.begin(), committed_pages.end());
+        committed_pages.erase(std::unique(committed_pages.begin(), committed_pages.end()),
+                              committed_pages.end());
+    };
     const auto overlaps_committed = [&](std::size_t victim_index,
                                         const PressureDecision& decision) -> bool {
         std::vector<std::uint32_t> text_targets;
         std::vector<std::uint32_t> back_targets;
         if (!collect_pages(victim_index, decision, text_targets, back_targets)) { return true; }
-        const auto overlaps = [&](const std::vector<std::uint32_t>& candidate,
-                                  const std::vector<std::uint32_t>& committed) {
+        const std::vector<std::uint32_t>& own = victim_pages[victim_index];
+        const auto overlaps = [&](const std::vector<std::uint32_t>& candidate) {
             for (const std::uint32_t page : candidate) {
-                if (std::find(committed.begin(), committed.end(), page) != committed.end()) {
+                if (std::binary_search(own.begin(), own.end(), page)) { continue; }
+                if (std::binary_search(committed_pages.begin(), committed_pages.end(), page)) {
                     return true;
                 }
             }
             return false;
         };
-        for (std::size_t other = 0; other < options.victims.size(); ++other) {
-            if (other == victim_index) { continue; }
-            const bool text_overlap  = overlaps(text_targets, victim_pages[other]);
-            const bool back_overlap  = overlaps(back_targets, victim_pages[other]);
-            if (text_overlap || back_overlap) {
-                return true;
-            }
-        }
-        return false;
+        return overlaps(text_targets) || overlaps(back_targets);
     };
     const auto commit_pages = [&](std::size_t victim_index, const PressureDecision& decision) {
         std::vector<std::uint32_t> text_targets;
@@ -1118,12 +1066,11 @@ PressurePlanningSessionImpl::deterministic_target(
         }
         std::vector<std::uint32_t>& own = victim_pages[victim_index];
         own.clear();
-        for (const std::uint32_t page : text_targets) {
-            if (std::find(own.begin(), own.end(), page) == own.end()) { own.push_back(page); }
-        }
-        for (const std::uint32_t page : back_targets) {
-            if (std::find(own.begin(), own.end(), page) == own.end()) { own.push_back(page); }
-        }
+        own.reserve(text_targets.size() + back_targets.size());
+        own.insert(own.end(), text_targets.begin(), text_targets.end());
+        own.insert(own.end(), back_targets.begin(), back_targets.end());
+        std::sort(own.begin(), own.end());
+        own.erase(std::unique(own.begin(), own.end()), own.end());
     };
 
 
@@ -1135,14 +1082,7 @@ PressurePlanningSessionImpl::deterministic_target(
     const auto trim_to_exclusive = [&](std::size_t victim_index,
                                        const PressureDecision& decision)
         -> std::optional<PressureDecision> {
-        std::vector<std::uint32_t> committed;
-        for (std::size_t other = 0; other < options.victims.size(); ++other) {
-            if (other == victim_index) { continue; }
-            committed.insert(committed.end(), victim_pages[other].begin(),
-                             victim_pages[other].end());
-        }
-        std::sort(committed.begin(), committed.end());
-        committed.erase(std::unique(committed.begin(), committed.end()), committed.end());
+        const std::vector<std::uint32_t>& own = victim_pages[victim_index];
 
         const auto [text_addr, back_addr] = owner_kv(victim_index);
 
@@ -1217,8 +1157,11 @@ PressurePlanningSessionImpl::deterministic_target(
                 for (std::uint32_t p = action.begin_page; p < end; ++p) {
                     const LogicalKVPageHandle logical =
                         addresses->logical_page(*address, p);
-                    const bool taken = std::binary_search(
-                        committed.begin(), committed.end(), pages->descriptor_index(logical));
+                    const std::uint32_t page = pages->descriptor_index(logical);
+                    const bool taken =
+                        !std::binary_search(own.begin(), own.end(), page) &&
+                        std::binary_search(committed_pages.begin(), committed_pages.end(),
+                                           page);
                     if (taken) {
                         if (p > run_begin) {
                             emit({.begin_page = run_begin, .page_count = p - run_begin,
@@ -1379,6 +1322,7 @@ PressurePlanningSessionImpl::deterministic_target(
     // decision strictly reduces device over-commitment. Host impact is deferred to
     // phase 2, so several demotes can chain even when the Host tier is momentarily full.
     for (std::size_t step = 0; step < maximum_steps; ++step) {
+        rebuild_committed();
         const detail::PhysicalResources residual =
             projected_residual(choice_scratch, std::nullopt, nullptr);
         if (device_key(residual) == 0) { break; }
@@ -1434,6 +1378,7 @@ PressurePlanningSessionImpl::deterministic_target(
     // Victims are considered in eviction order (smallest first) so a host-relief
     // eviction takes the least destructive victim available, not the lowest ID.
     for (std::size_t step = 0; step < maximum_steps; ++step) {
+        rebuild_committed();
         const detail::PhysicalResources residual =
             projected_residual(choice_scratch, std::nullopt, nullptr);
         if (feasible(residual)) { break; }
@@ -1672,6 +1617,7 @@ PressurePlanningSessionImpl::deterministic_target(
         if (!program->host_kv_requests_fit(phase4_main_pages, phase4_back_pages)) {
             std::fprintf(stderr, "[PP] P4 allocator_rejects_demotes\n");
             for (std::size_t step = 0; step < maximum_steps; ++step) {
+                rebuild_committed();
                 if (compose_accepts()) {
                     // compose_accepts credits the plan's own Host releases (DHD /
                     // eviction) against its demote demand. That credit is only real
