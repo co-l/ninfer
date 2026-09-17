@@ -1672,7 +1672,21 @@ PressurePlanningSessionImpl::deterministic_target(
         if (!program->host_kv_requests_fit(phase4_main_pages, phase4_back_pages)) {
             std::fprintf(stderr, "[PP] P4 allocator_rejects_demotes\n");
             for (std::size_t step = 0; step < maximum_steps; ++step) {
-                if (compose_accepts()) { break; }
+                if (compose_accepts()) {
+                    // compose_accepts credits the plan's own Host releases (DHD /
+                    // eviction) against its demote demand. That credit is only real
+                    // once materialized, and concurrent in-flight plans can
+                    // double-count the same frees against one snapshot. A plan is
+                    // acceptable only when its remaining host-adding demotes also fit
+                    // the conservative no-release check; otherwise the fix-up below
+                    // converts dead host-adding demotes to evictions until the plan
+                    // is genuinely materializable.
+                    collect_demotes();
+                    if (phase4_main_pages.empty() && phase4_back_pages.empty()) { break; }
+                    if (program->host_kv_requests_fit(phase4_main_pages, phase4_back_pages)) {
+                        break;
+                    }
+                }
                 // Host-placement fix-up. Two complementary actions free what the plan
                 // still needs: demote a live victim's overflow to the freed Host (an
                 // active session's prefix must never be destroyed while a demote of it
