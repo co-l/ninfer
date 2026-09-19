@@ -64,6 +64,17 @@ API: `usage.prompt_tokens_details.cached_tokens` cannot distinguish a device hit
 restore. The log is cumulative — slice by timestamps or line offsets, and exclude the maintainer
 agent's own traffic when its model is served by the box.
 
+The request log is **opt-in** (`REQUEST_LOG` in `.env` / `start.sh`, empty by default): the full
+log grows unbounded and is only needed for debug or bench runs. Activate it before starting the
+server when you plan to validate:
+
+```bash
+REQUEST_LOG=/logs/requests.jsonl ./start.sh   # or export / set in .env
+```
+
+A bench run against a server started without `REQUEST_LOG` has no verifiable ground truth — the
+gates below cannot be trusted then.
+
 ## Deployment reference
 
 - Box: RTX 5090, ~30 GiB RAM, reachable over ssh (`BOX` in `.env`; the scripts exit with a
