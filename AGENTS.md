@@ -47,17 +47,17 @@ streamed output is the progress. Prefix Python benches with `env PYTHONUNBUFFERE
 
 ## Validation (the deployment gate)
 
-The harness is the `cache-pressure` project at `../cache-pressure` (uv: `uv run <tool>`, never
-`uvx --from .`). Benches run from the workstation against the box endpoint and exit non-zero on
-failure. They must pass **back-to-back on the same server** — a dirty cache is the norm, never
-restart to make a bench pass. (`--base-url http://<box>:8000/v1` implied.)
+The harness is the `cache-pressure` Python project (`uvx --from cache-pressure <tool>` from the
+workstation). Benches run against the box endpoint and exit non-zero on failure. They must pass
+**back-to-back on the same server** — a dirty cache is the norm, never restart to make a bench
+pass. (`--base-url http://<box>:8000/v1` implied.)
 
 | Bench | Command | Pass bar |
 |---|---|---|
-| `agent-sim` | `uv run agent-sim --sessions 4 --main-tokens 150000 --sub-tokens 40000` | 4/4 finalize ≥ 98.6% reuse, 116/116 mains, zero `selected_maximal_fallback` |
-| `abort-sim` | `uv run abort-sim --context-tokens 40000 --thinking-tokens 500 --runs 2` | every run reuses ≥ 95% of the re-prompt and never takes the `root` path |
-| `needle-test` | `uv run needle-test --lengths 50000,100000,200000` | every length PASS |
-| `cache-pressure` | `uv run cache-pressure --kv-size 460000 --context-tokens 16000` | every context inside the 40-slot ceiling retained and verified; only the KV overflow shed, LRU oldest-first |
+| `agent-sim` | `uvx --from cache-pressure agent-sim --sessions 4 --main-tokens 150000 --sub-tokens 40000` | 4/4 finalize ≥ 98.6% reuse, 116/116 mains, zero `selected_maximal_fallback` |
+| `abort-sim` | `uvx --from cache-pressure abort-sim --context-tokens 40000 --thinking-tokens 500 --runs 2` | every run reuses ≥ 95% of the re-prompt and never takes the `root` path |
+| `needle-test` | `uvx --from cache-pressure needle-test --lengths 50000,100000,200000` | every length PASS |
+| `cache-pressure` | `uvx --from cache-pressure cache-pressure --kv-size 460000 --context-tokens 16000` | every context inside the 40-slot ceiling retained and verified; only the KV overflow shed, LRU oldest-first |
 
 Ground truth comes from the request log (`--request-log-jsonl /logs/requests.jsonl`), not the
 API: `usage.prompt_tokens_details.cached_tokens` cannot distinguish a device hit from a host-tier
