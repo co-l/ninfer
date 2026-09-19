@@ -5,9 +5,9 @@
 # longer carries are purged automatically; the box-local models/ and logs/
 # directories are never touched.
 #
-# The build stops ninfer-serve first: the serving footprint pins ~28 of the
-# box's 30 GiB RAM, so the compile (~7 GiB at -j16) only fits with the server
-# down — not because the build is memory-heavy.
+# The build stops ninfer-serve first: the serving footprint pins most of the
+# box's RAM, so the compile only fits with the server down — not because the
+# build is memory-heavy.
 #
 # Usage: ./deploy.sh [--dry-run]
 #   --dry-run  show the sync plan only (no build)
@@ -17,15 +17,15 @@
 #   CONTAINER_RUNTIME (podman|docker), CONTAINER_SUDO, CONTAINER_NAME.
 #
 # Next steps after a real deploy:
-#   ./start.sh   # serve (stops vLLM/SGLang, starts ninfer)
+#   ./start.sh   # serve (stops the previous server, starts ninfer)
 #   # then the cache-pressure bench suite (agent-sim, needle-test, cache-pressure)
 
 set -euo pipefail
 . "$(cd -- "$(dirname -- "$0")" && pwd)/deploy-lib.sh"
 load_env
 
-BOX="${BOX:-gaming_pc}"
-REMOTE_DIR="${REMOTE_DIR:-/home/conrad/dev/nicefox-5090-prod}"
+BOX="${BOX:-inference-box}"
+REMOTE_DIR="${REMOTE_DIR:-/opt/ninfer}"
 IMAGE="${IMAGE:-localhost/ninfer:local}"
 BUILD_PARALLEL="${BUILD_PARALLEL:-16}"
 CONTAINER_RUNTIME="${CONTAINER_RUNTIME:-podman}"
@@ -42,8 +42,7 @@ DRY_RUN=0
 if [ "${1:-}" = "--dry-run" ]; then DRY_RUN=1; fi
 
 if ! "${SSH[@]}" "$BOX" 'true' >/dev/null 2>&1; then
-  echo "error: box '$BOX' is not reachable — wake it first:" >&2
-  echo "  ../5090/poweron-gaming-pc.sh" >&2
+  echo "error: box '$BOX' is not reachable — wake it first" >&2
   exit 1
 fi
 
@@ -85,4 +84,4 @@ echo "building $IMAGE on $BOX ($CONTAINER_RUNTIME, ninja $BUILD_PARALLEL, ~4 min
 echo
 echo "deploy complete: $BOX:$REMOTE_DIR built $IMAGE"
 echo "next:"
-echo "  ./start.sh    # serve (stops vLLM/SGLang, starts ninfer)"
+echo "  ./start.sh    # serve (stops the previous server, starts ninfer)"

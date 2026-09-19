@@ -10,8 +10,8 @@ set -euo pipefail
 . "$(cd -- "$(dirname -- "$0")" && pwd)/deploy-lib.sh"
 load_env
 
-BOX="${BOX:-gaming_pc}"
-REMOTE_DIR="${REMOTE_DIR:-/home/conrad/dev/nicefox-5090-prod}"
+BOX="${BOX:-inference-box}"
+REMOTE_DIR="${REMOTE_DIR:-/opt/ninfer}"
 IMAGE="${IMAGE:-localhost/ninfer:local}"
 CONTAINER_RUNTIME="${CONTAINER_RUNTIME:-podman}"
 CONTAINER_SUDO="${CONTAINER_SUDO-sudo}"

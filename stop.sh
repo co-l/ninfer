@@ -1,5 +1,5 @@
 #!/bin/bash
-# Stop the ninfer-serve container on the box (frees ~31 GiB VRAM).
+# Stop the ninfer-serve container on the box (frees the serving footprint).
 #
 # Usage: ./stop.sh
 # Configuration: shell env > ./.env > defaults
@@ -9,7 +9,7 @@ set -euo pipefail
 . "$(cd -- "$(dirname -- "$0")" && pwd)/deploy-lib.sh"
 load_env
 
-BOX="${BOX:-gaming_pc}"
+BOX="${BOX:-inference-box}"
 CONTAINER_RUNTIME="${CONTAINER_RUNTIME:-podman}"
 CONTAINER_SUDO="${CONTAINER_SUDO-sudo}"
 CONTAINER_NAME="${CONTAINER_NAME:-ninfer-serve}"
