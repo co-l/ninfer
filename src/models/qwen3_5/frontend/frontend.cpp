@@ -709,6 +709,11 @@ PreparedPromptData PreparedPromptAccess::take(PreparedPrompt&& prompt) {
     return std::move(*data);
 }
 
+PreparedPrompt PreparedPromptAccess::adopt(std::unique_ptr<PreparedPromptData> data) {
+    if (!data) { throw std::invalid_argument("adopted prompt is empty"); }
+    return PreparedPrompt(std::move(data));
+}
+
 const PreparedPromptData& FrontendTestAccess::inspect(const PreparedPrompt& prompt) {
     return PreparedPromptAccess::view(prompt);
 }

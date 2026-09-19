@@ -1520,6 +1520,23 @@ private:
                                 "aborted materialization retained an activation");
                         }
                         materializing_.reset();
+                        if (terminal.replan_prompt) {
+                            // The Host arena could not place this plan's demotes. Re-queue the
+                            // request with its prompt so it re-plans against the post-abort
+                            // arena (this transaction's committed evictions and swept dead
+                            // content are now free) instead of failing the request.
+                            request->prompt = ninfer::models::qwen3_5::PreparedPromptAccess::adopt(
+                                std::make_unique<ninfer::models::qwen3_5::PreparedPromptData>(
+                                    std::move(*terminal.replan_prompt)));
+                            request->model_state = EngineRequestState::Waiting;
+                            {
+                                std::lock_guard lock(queue_mutex_);
+                                pending_.push_back(request);
+                            }
+                            request_admission_check();
+                            publish_runtime_stats();
+                            return AdmissionProgress::ControlProgress;
+                        }
                         complete_detached_cancelled(request);
                         request_admission_check();
                         publish_runtime_stats();
@@ -1727,7 +1744,16 @@ private:
             const ActiveAdmissionSet active =
                 scheduler_.active_admission_set(slots_, max_concurrency_);
             if (active.size == 0) {
-                throw std::logic_error("isolated-feasible request is blocked in an idle Engine");
+                // The head is blocked while the Engine has no active request to act as a
+                // protection donor. This is normally a transient of terminal settlement
+                // (recently-completed requests are still being catalogued and their pages
+                // released), so keep making control progress instead of asserting or
+                // dropping the request: re-arm the admission check and retry on the next
+                // boundary. If the block is real and permanent, the request's own deadline
+                // turns the wait into a clean QueueTimeout rather than a wedged Engine.
+                request_admission_check();
+                return control_progress ? AdmissionProgress::ControlProgress
+                                        : AdmissionProgress::None;
             }
             if (!scheduler_.protect_blocked_head(head->id, active.span(),
                                                  instance_.program->resource_revision())) {
@@ -1971,6 +1997,7 @@ private:
                 set_host_work_class(HostWorkClass::Control);
                 HostPhaseMeasurement boundary = begin_host_phase();
                 const bool have_pending       = expire_pending_requests();
+                (void)resources_.reclaim_dead_host_retained(*instance_.program);
                 (void)progress_context_transaction(have_pending);
                 (void)settle_terminal_requests(boundary);
                 const auto cancelled_at_boundary = snapshot_cancellations();

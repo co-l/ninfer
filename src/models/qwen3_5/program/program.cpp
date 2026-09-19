@@ -134,8 +134,14 @@ PressurePlanningSession::root_maximal_target(
 }
 
 PressureTargetHandle
-PressurePlanningSession::maximal_target(runtime::PlanningCandidateId candidate) {
-    return impl_->maximal_target(candidate);
+PressurePlanningSession::maximal_target(
+    runtime::PlanningCandidateId candidate,
+    std::span<const runtime::PlanningOwnerId> preferred_owner_ids,
+    std::span<const std::uint32_t> preferred_owner_weights,
+    std::span<const std::uint64_t> preferred_owner_epochs,
+    bool shed_live, std::uint64_t global_activity_epoch) {
+    return impl_->maximal_target(candidate, preferred_owner_ids, preferred_owner_weights,
+                                 preferred_owner_epochs, shed_live, global_activity_epoch);
 }
 
 PressureConstructionCursor PressurePlanningSession::begin_construction(PressureTargetHandle target,
@@ -171,10 +177,11 @@ PressurePlanningSession::deterministic_target(
     runtime::PlanningCandidateId candidate,
     std::span<const runtime::PlanningOwnerId> preferred_owner_ids,
     std::span<const std::uint32_t> preferred_owner_weights,
-    std::span<const std::uint64_t> preferred_owner_epochs) {
+    std::span<const std::uint64_t> preferred_owner_epochs,
+    std::uint64_t global_activity_epoch) {
     if (impl_ == nullptr) { throw std::logic_error("pressure planning session is empty"); }
     return impl_->deterministic_target(candidate, preferred_owner_ids, preferred_owner_weights,
-                                       preferred_owner_epochs);
+                                       preferred_owner_epochs, global_activity_epoch);
 }
 
 runtime::PressureTargetGuidance PressurePlanningSession::guidance(PressureTargetHandle target) {
@@ -497,6 +504,10 @@ runtime::ProgramResourceRevision Program::resource_revision() const noexcept {
 }
 
 PhysicalUsageSnapshot Program::physical_usage() const noexcept { return impl_->physical_usage(); }
+
+std::size_t Program::host_kv_capacity_bytes() const noexcept {
+    return impl_->host_kv_capacity_bytes();
+}
 
 MemorySummary Program::memory_summary() const noexcept { return impl_->memory_summary(); }
 

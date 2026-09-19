@@ -215,6 +215,16 @@ public:
         return largest;
     }
 
+    [[nodiscard]] std::pair<std::size_t, std::size_t> free_extent_stats() const noexcept {
+        std::size_t count = 0;
+        std::size_t sum   = 0;
+        for (const FreeExtent& extent : free_extents_) {
+            ++count;
+            sum += extent.bytes;
+        }
+        return {count, sum};
+    }
+
     [[nodiscard]] const HostKVPageLayout* layout_for(const KVPageGeometry& geometry) const noexcept;
 
     [[nodiscard]] bool can_allocate(const HostKVPageLayout& layout,

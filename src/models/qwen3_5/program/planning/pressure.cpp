@@ -894,9 +894,6 @@ ProgramImpl::inspect_pressure_option(const SequenceState& sequence,
             if (c.kind == PressureKVDecisionKind::DropHostDuplicate) { dh += c.page_count; }
             if (c.kind == PressureKVDecisionKind::DemoteToHost) { dm += c.page_count; }
         }
-        std::fprintf(stderr,
-                     "[PDROP] host=%zu main_dhd=%zu main_demote=%zu back_changes=%zu\n",
-                     deficit.host.kv_bytes, dh, dm, option.backend_kv_changes.size());
     }
     option.id = identity == 0 ? 1 : identity;
     return option;
@@ -2021,11 +2018,11 @@ bool ProgramImpl::compose_pressure_candidate(
     details.pressure_generations.reserve(pressure_options.size());
 
     bool pressure_needs_transfer = false;
-    std::vector<HostKVPageLayout> host_layouts;
-    std::vector<HostKVAllocationRequest> private_host_requests;
-    std::vector<HostKVAllocationRequest> shared_host_requests;
-    std::vector<HostKVPageReplicaRelease> host_releases;
-    std::vector<HostKVPageReplicaRelease> host_last_reference_releases;
+    std::vector<HostKVPageLayout>& host_layouts = details.host_kv_layouts;
+    std::vector<HostKVAllocationRequest>& host_requests = details.host_kv_requests;
+    std::vector<HostKVPageReplicaRelease>& host_releases = details.host_kv_releases;
+    std::vector<HostKVPageReplicaRelease>& host_last_reference_releases =
+        details.host_kv_last_reference_releases;
     const auto demotion_count = [](const qwen3_5::detail::PressureDecision& option) {
         const auto count = [](const auto& changes) {
             return static_cast<std::size_t>(
@@ -2050,8 +2047,7 @@ bool ProgramImpl::compose_pressure_candidate(
         shared_demotion_count += demotion_count(*option);
     }
     host_layouts.reserve(private_demotion_count + shared_demotion_count);
-    private_host_requests.reserve(private_demotion_count);
-    shared_host_requests.reserve(shared_demotion_count);
+    host_requests.reserve(private_demotion_count + shared_demotion_count);
     const auto append_host_releases = [&](KVAddressSpaceStore& addresses, LogicalKVPageStore& pages,
                                           KVAddressSpaceHandle address,
                                           const qwen3_5::detail::PressureKVDecision& action) {
@@ -2122,13 +2118,13 @@ bool ProgramImpl::compose_pressure_candidate(
             return false;
         }
         append_kv_actions(*text_kv_addresses, *text_kv_pages, pressure_owner.kv->text,
-                          expected.main_kv_changes, private_host_requests);
+                          expected.main_kv_changes, host_requests);
         if (!expected.backend_kv_changes.empty()) {
             if (!pressure_owner.kv->backend || !backend_kv_addresses || !backend_kv_pages) {
                 return false;
             }
             append_kv_actions(*backend_kv_addresses, *backend_kv_pages, *pressure_owner.kv->backend,
-                              expected.backend_kv_changes, private_host_requests);
+                              expected.backend_kv_changes, host_requests);
         }
     }
 
@@ -2183,13 +2179,13 @@ bool ProgramImpl::compose_pressure_candidate(
             return false;
         }
         append_kv_actions(*text_kv_addresses, *text_kv_pages, pressure_owner.kv->text,
-                          expected.main_kv_changes, shared_host_requests);
+                          expected.main_kv_changes, host_requests);
         if (!expected.backend_kv_changes.empty()) {
             if (!pressure_owner.kv->backend || !backend_kv_addresses || !backend_kv_pages) {
                 return false;
             }
             append_kv_actions(*backend_kv_addresses, *backend_kv_pages, *pressure_owner.kv->backend,
-                              expected.backend_kv_changes, shared_host_requests);
+                              expected.backend_kv_changes, host_requests);
         }
     }
 
@@ -2315,12 +2311,6 @@ bool ProgramImpl::compose_pressure_candidate(
         }
     }
 
-    std::vector<HostKVAllocationRequest> host_requests;
-    host_requests.reserve(shared_host_requests.size() + private_host_requests.size());
-    host_requests.insert(host_requests.end(), shared_host_requests.begin(),
-                         shared_host_requests.end());
-    host_requests.insert(host_requests.end(), private_host_requests.begin(),
-                         private_host_requests.end());
     if (!host_requests.empty()) {
         std::size_t requested_bytes = 0;
         for (const HostKVAllocationRequest& request : host_requests) {
@@ -2540,6 +2530,34 @@ ProgramImpl::revalidate_materialization(const AdmissionCandidate& plan,
                       details.shared_pressure_owner_ids[victim]) !=
                 details.pressure_owner_ids.end()) {
             return runtime::PreflightStatus::InvariantFailure;
+        }
+    }
+
+    // The composition-time Host fit can go stale while other materializations commit demotes:
+    // re-check the plan's Host requests against the CURRENT arena. The plan executes as one
+    // serial transaction whose own releases precede its demotes, so a pass here means the
+    // allocator can place every demote at CopyPreparation. Retained-tail backups are part of
+    // the same transaction and are modeled conservatively as one page each.
+    if (!details.host_kv_requests.empty() || details.text_retained_tail_release ||
+        details.backend_retained_tail_release) {
+        std::vector<HostKVPageLayout> tail_layouts;
+        std::vector<HostKVAllocationRequest> requests = details.host_kv_requests;
+        const auto append_tail = [&](LogicalKVPageStore* pages, bool retained_tail_release) {
+            if (!retained_tail_release || pages == nullptr) { return; }
+            tail_layouts.push_back(plan_host_kv_page_layout(pages->physical_pool().geometry()));
+            requests.push_back({.layout = &tail_layouts.back(), .pages = 1});
+        };
+        append_tail(text_kv_pages.get(), details.text_retained_tail_release);
+        append_tail(backend_kv_pages.get(), details.backend_retained_tail_release);
+        if (host_kv_extents == nullptr ||
+            !host_kv_extents->can_allocate_after_page_releases(
+                details.host_kv_releases, details.host_kv_last_reference_releases, requests)) {
+            if (trace_pressure) {
+                std::fprintf(stderr, "[RV] HOST-PLACEMENT-FAIL pvt=%zu shd=%zu req=%zu\n",
+                             details.pressure_options.size(),
+                             details.shared_pressure_options.size(), requests.size());
+            }
+            return runtime::PreflightStatus::StalePolicyState;
         }
     }
 

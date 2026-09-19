@@ -346,7 +346,7 @@ image**.
 | `agent-sim` | `uv run agent-sim --sessions 4 --main-tokens 150000 --sub-tokens 40000` | four concurrent 150K-token agent sessions survive cache pressure: main-continuation reuse and finalize survival | 4/4 finalize ≥ 98.6% reuse, 116/116 mains, zero `selected_maximal_fallback` (ground truth via `--ninfer-log`) |
 | `abort-sim` | `uv run abort-sim --context-tokens 40000 --thinking-tokens 500 --runs 2` | a mid-thinking client abort loses no processed prefix: re-orientation re-sends the captured partial turn and must reuse it | every run reuses ≥ 95% of the re-prompt and never takes the `root` path (see `../5090/SESSION-2026-09-13-abort-repro.md`) |
 | `needle-test` | `uv run needle-test --lengths 50000,100000,200000` | end-to-end long-context retrieval stays intact (hidden secret codes at depth) — the cache is not masking a broken prefill | every length PASS |
-| `cache-pressure` | `uv run cache-pressure --kv-size 460000` | retention under real overflow pressure: hydrate `ceil(kv-size/8001)+5` ~8K contexts (63 at 460K), re-send in reverse order | 100% retained (63/63 at 460K), ≈ 108% of the advertised capacity — on a cache already holding other dead content (no restart) |
+| `cache-pressure` | `uv run cache-pressure --kv-size 460000 --context-tokens 16000` | retention under real overflow pressure: hydrate `ceil(kv-size/16001)+5` ~16K contexts (34 at 460K), re-send in reverse order | every context inside the 40-context host-state ceiling is retained and verified (hit or host-restore); only the KV overflow (≈ 5 contexts) is shed, strictly LRU oldest-first — the 65×8K variant needs ≥ 96 host-state slots and is out of scope on the 32-slot deployment (see the sweep-derived floors) |
 
 Remote work runs by direct call (agent behaviour):
 
@@ -426,12 +426,17 @@ Hygiene (results are only comparable when these hold):
 
 Serving flags (as deployed): `--max-context 262144 --kv-capacity 460000
 --max-concurrency 4 --max-pending-requests 16 --pending-timeout-ms 600000
---device-state-slots 4 --host-state-slots 96 --host-kv-mib 12288
+--device-state-slots 4 --host-state-slots 32 --host-kv-mib 16384
 --max-private-continuations 128 --max-shared-prefixes 64 --kv-dtype nvfp4
 --spec mtp --draft-tokens 4 --lm-head-draft --preserve-thinking --vision`.
-Sweep-derived floors in `ninfer-serve.sh`'s header: 460K is the VRAM-safe
-device pool (hard limit ≈ 469K at C=4), 96 host state slots and 12 GiB host
-KV are mandatory for finalize survival, `--max-private-continuations 128` is
+Sweep-derived floors in `start.sh`'s header: 460K is the VRAM-safe
+device pool (hard limit ≈ 469K at C=4), 32 host state slots and 16 GiB host
+KV are the validated floor (agent-sim 10× dirty — the host KV tier is the
+finalize-survival tier and is used to the brim). The host-state pool sets the
+retention ceiling (≈ 40 contexts: 8 device + 32 host), so the `cache-pressure`
+gate uses the ~16K-context variant that fits that ceiling; the 65×8K set needs
+≥ 96 slots (a 13.8 GiB state pool) that no longer fits the 30 GiB box next to
+the 16 GiB KV tier. `--max-private-continuations 128` is
 required by the 65×8K retention set, and no container memory limit is set on
 purpose (the pinned state+KV footprint needs the whole box).
 

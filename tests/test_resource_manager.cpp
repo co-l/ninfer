@@ -2567,6 +2567,28 @@ void test_retained_source_is_protected_until_terminal() {
             "released source did not participate in the sealed pressure plan");
 }
 
+void test_idle_retained_pressure_blocks_head() {
+    FakeManager manager = make_manager(2, 3);
+    FakeProgram program;
+    const FakeCacheSessionKey session{1};
+    const ActiveRequest seed = start_active(
+        manager, program, 9, make_base(9, session, RetentionClass::LiveSession), 1);
+    (void)finish_active(manager, program, seed);
+
+    // Retained live content saturates the tiers while nothing is active; the relief a
+    // single owner can provide (spill one unit, drop two) cannot close the required
+    // pressure, so every plan is infeasible and the idle Engine reports a blocked head.
+    // The Engine must reject that head cleanly instead of asserting — this condition
+    // previously wedged the whole Engine (fail_all_locked) via the admission loop's
+    // "isolated-feasible request is blocked in an idle Engine" logic_error.
+    program.required_pressure_actions = 3;
+    auto blocked = manager.inspect(program, FakePreparedPrompt{77}, make_base(77), 3);
+    require(blocked.readiness == Readiness::TemporarilyBlocked && !blocked.choice,
+            "retained live content must be able to block an idle Engine's FIFO head");
+    require(manager.lane_state(seed.lane) == ninfer::runtime::LogicalLaneState::Free,
+            "blocked-idle inspection must not depend on an active request");
+}
+
 void test_session_publication_order_controls_tied_source() {
     FakeManager manager = make_manager(2, 3);
     FakeProgram program;
@@ -3186,6 +3208,7 @@ int main() {
     run_test("uncommitted pressure acknowledgement",
              test_uncommitted_pressure_acknowledgement_is_not_degradation);
     run_test("retained source protection", test_retained_source_is_protected_until_terminal);
+    run_test("idle retained pressure blocks head", test_idle_retained_pressure_blocks_head);
     run_test("session publication order", test_session_publication_order_controls_tied_source);
     run_test("joint two-owner pressure", test_two_owners_jointly_close_pressure);
     run_test("validate complete materialization result before adoption",

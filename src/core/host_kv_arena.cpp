@@ -489,6 +489,8 @@ bool HostKVArena::can_allocate_after_suballocation_releases(
     // HostKVExtentStore::prepare's fallback: under Host churn the tier fragments into
     // slivers that individually cannot hold a whole demote, and a single-request
     // rejection would declare a plan infeasible despite ample aggregate free space.
+    // Page granularity is mandatory: the real allocator places whole pages per extent and
+    // can never split one page across slivers, so the simulation must not either.
     for (const HostKVAllocationRequest& request : target_allocations) {
         if (request.layout == nullptr || request.pages == 0) { return false; }
         const std::optional<std::uint32_t> layout_index = find_layout(*request.layout);
@@ -496,15 +498,16 @@ bool HostKVArena::can_allocate_after_suballocation_releases(
             request.layout->page_stride > std::numeric_limits<std::size_t>::max() / request.pages) {
             return false;
         }
-        std::size_t remaining =
-            request.layout->page_stride * static_cast<std::size_t>(request.pages);
-        std::size_t used_extents = 0;
+        const std::size_t stride   = request.layout->page_stride;
+        std::size_t remaining      = request.pages;
+        std::size_t used_extents   = 0;
         while (remaining != 0) {
             std::size_t largest_extent = 0;
             for (const FreeExtent& free : simulated) {
                 largest_extent = std::max(largest_extent, free.bytes);
             }
-            if (largest_extent == 0) {
+            const std::size_t fit = largest_extent / stride;
+            if (fit == 0) {
                 std::size_t simulated_free = 0;
                 for (const FreeExtent& free : simulated) { simulated_free += free.bytes; }
                 std::fprintf(stderr,
@@ -514,7 +517,8 @@ bool HostKVArena::can_allocate_after_suballocation_releases(
                              free_bytes());
                 return false;
             }
-            const std::size_t take_bytes = std::min(remaining, largest_extent);
+            const std::size_t take       = std::min(remaining, fit);
+            const std::size_t take_bytes = take * stride;
             const auto extent =
                 std::find_if(simulated.begin(), simulated.end(),
                              [&](const FreeExtent& free) { return free.bytes >= take_bytes; });
@@ -524,14 +528,14 @@ bool HostKVArena::can_allocate_after_suballocation_releases(
                 std::fprintf(stderr,
                              "[ARENA] placement-fail nfree=%zu largest_free=%zu this_req=%zu "
                              "simulated_free=%zu arena_free=%zu\n",
-                             simulated.size(), largest_extent, take_bytes, simulated_free,
+                             simulated.size(), largest_extent, take, simulated_free,
                              free_bytes());
                 return false;
             }
             extent->offset += take_bytes;
             extent->bytes -= take_bytes;
             if (extent->bytes == 0) { simulated.erase(extent); }
-            remaining -= take_bytes;
+            remaining -= take;
             ++used_extents;
         }
         if (used_extents > 1) { required_descriptors += used_extents - 1U; }

@@ -24,6 +24,9 @@ ProgramImpl::reserve_materialization(AdmissionCandidate&& plan, PreparedPromptDa
                                      runtime::CancellationFlagView cancellation) {
     if (cancellation.requested()) { return runtime::ContextTransactionReserveStatus::Aborted; }
     const runtime::PreflightStatus preflight = revalidate_materialization(plan, prompt);
+    if (preflight == runtime::PreflightStatus::StalePolicyState) {
+        return runtime::ContextTransactionReserveStatus::Aborted;
+    }
     if (preflight != runtime::PreflightStatus::Ready) {
         throw std::logic_error("materialization changed after successful preflight");
     }
@@ -1957,87 +1960,148 @@ ProgramImpl::progress_materialization_transaction(runtime::CancellationFlagView 
             abort_transaction();
             return out;
         }
+        if (host_kv_extents != nullptr) {
+            (void)host_kv_extents->release_unreferenced();
+        }
 
         constexpr std::array pressure_resources{
             runtime::ContextResourceClass::State,
             runtime::ContextResourceClass::MainKV,
             runtime::ContextResourceClass::BackendKV,
         };
-        try {
-            for (const runtime::ContextResourceClass resource : pressure_resources) {
-                bool has_copy = false;
-                for_each_pending_pressure(
-                    [&](const MaterializationTransaction::PressureWork& work) {
-                        has_copy =
-                            has_copy ||
-                            std::any_of(
-                                work.option.transfer_requirements.begin(),
-                                work.option.transfer_requirements.end(),
-                                [&](const auto& requirement) {
-                                    return requirement.resource == resource &&
-                                           requirement.direction ==
-                                               runtime::ContextTransferDirection::DeviceToHost;
-                                });
-                    });
-                if (has_copy) { start_context_transfer_timer(resource); }
+        bool host_retried = false;
+        const auto reset_pressure_work_for_retry =
+            [&](MaterializationTransaction::PressureWork& work) noexcept {
                 try {
-                    for_each_pending_pressure([&](MaterializationTransaction::PressureWork& work) {
-                        prepare_pressure_work(work, resource);
-                    });
-                } catch (...) {
-                    if (has_copy) { stop_context_transfer_timer(resource); }
-                    throw;
-                }
-                if (!has_copy) { continue; }
-                stop_context_transfer_timer(resource);
-                const std::size_t resource_index = context_resource_index(resource);
-                pressure_transition.timer_mask |= static_cast<std::uint8_t>(1U << resource_index);
-                for_each_pending_pressure(
-                    [&](const MaterializationTransaction::PressureWork& work) {
-                        for (const runtime::ContextTransferRequirement& requirement :
-                             work.option.transfer_requirements) {
-                            if (requirement.resource != resource ||
-                                requirement.direction !=
-                                    runtime::ContextTransferDirection::DeviceToHost) {
-                                continue;
-                            }
-                            TransferWork& total = pressure_transition.transfer_work[resource_index];
-                            total.payload_bytes =
-                                requirement.work.payload_bytes >
-                                        std::numeric_limits<std::uint64_t>::max() -
-                                            total.payload_bytes
-                                    ? std::numeric_limits<std::uint64_t>::max()
-                                    : total.payload_bytes + requirement.work.payload_bytes;
-                            const std::uint64_t operations =
-                                static_cast<std::uint64_t>(total.copy_operations) +
-                                requirement.work.copy_operations;
-                            total.copy_operations =
-                                operations > std::numeric_limits<std::uint32_t>::max()
-                                    ? std::numeric_limits<std::uint32_t>::max()
-                                    : static_cast<std::uint32_t>(operations);
-                            const std::uint64_t pages =
-                                static_cast<std::uint64_t>(
-                                    pressure_transition.transfer_pages[resource_index]) +
-                                requirement.page_count;
-                            pressure_transition.transfer_pages[resource_index] =
-                                pages > std::numeric_limits<std::uint32_t>::max()
-                                    ? std::numeric_limits<std::uint32_t>::max()
-                                    : static_cast<std::uint32_t>(pages);
-                            if (resource == runtime::ContextResourceClass::State) {
-                                pressure_transition.state_images =
-                                    requirement.units > std::numeric_limits<std::uint64_t>::max() -
-                                                            pressure_transition.state_images
-                                        ? std::numeric_limits<std::uint64_t>::max()
-                                        : pressure_transition.state_images + requirement.units;
-                            }
+                    if (work.completed) { return; }
+                    for (auto& change : work.state_changes) {
+                        if (change.transfer) {
+                            state_store->abort_transfer(std::move(*change.transfer));
+                            change.transfer.reset();
                         }
+                    }
+                    for (auto& change : work.main_kv_changes) { change.backup.reset(); }
+                    for (auto& change : work.backend_kv_changes) { change.backup.reset(); }
+                    work.submitted = false;
+                } catch (...) { std::terminate(); }
+            };
+        for (;;) {
+            try {
+                for (const runtime::ContextResourceClass resource : pressure_resources) {
+                    bool has_copy = false;
+                    for_each_pending_pressure(
+                        [&](const MaterializationTransaction::PressureWork& work) {
+                            has_copy =
+                                has_copy ||
+                                std::any_of(
+                                    work.option.transfer_requirements.begin(),
+                                    work.option.transfer_requirements.end(),
+                                    [&](const auto& requirement) {
+                                        return requirement.resource == resource &&
+                                               requirement.direction ==
+                                                   runtime::ContextTransferDirection::DeviceToHost;
+                                    });
+                        });
+                    if (has_copy) { start_context_transfer_timer(resource); }
+                    try {
+                        for_each_pending_pressure(
+                            [&](MaterializationTransaction::PressureWork& work) {
+                                prepare_pressure_work(work, resource);
+                            });
+                    } catch (...) {
+                        if (has_copy) { stop_context_transfer_timer(resource); }
+                        throw;
+                    }
+                    if (!has_copy) { continue; }
+                    stop_context_transfer_timer(resource);
+                    const std::size_t resource_index = context_resource_index(resource);
+                    pressure_transition.timer_mask |= static_cast<std::uint8_t>(1U << resource_index);
+                    for_each_pending_pressure(
+                        [&](const MaterializationTransaction::PressureWork& work) {
+                            for (const runtime::ContextTransferRequirement& requirement :
+                                 work.option.transfer_requirements) {
+                                if (requirement.resource != resource ||
+                                    requirement.direction !=
+                                        runtime::ContextTransferDirection::DeviceToHost) {
+                                    continue;
+                                }
+                                TransferWork& total = pressure_transition.transfer_work[resource_index];
+                                total.payload_bytes =
+                                    requirement.work.payload_bytes >
+                                            std::numeric_limits<std::uint64_t>::max() -
+                                                total.payload_bytes
+                                        ? std::numeric_limits<std::uint64_t>::max()
+                                        : total.payload_bytes + requirement.work.payload_bytes;
+                                const std::uint64_t operations =
+                                    static_cast<std::uint64_t>(total.copy_operations) +
+                                    requirement.work.copy_operations;
+                                total.copy_operations =
+                                    operations > std::numeric_limits<std::uint32_t>::max()
+                                        ? std::numeric_limits<std::uint32_t>::max()
+                                        : static_cast<std::uint32_t>(operations);
+                                const std::uint64_t pages =
+                                    static_cast<std::uint64_t>(
+                                        pressure_transition.transfer_pages[resource_index]) +
+                                    requirement.page_count;
+                                pressure_transition.transfer_pages[resource_index] =
+                                    pages > std::numeric_limits<std::uint32_t>::max()
+                                        ? std::numeric_limits<std::uint32_t>::max()
+                                        : static_cast<std::uint32_t>(pages);
+                                if (resource == runtime::ContextResourceClass::State) {
+                                    pressure_transition.state_images =
+                                        requirement.units >
+                                                std::numeric_limits<std::uint64_t>::max() -
+                                                    pressure_transition.state_images
+                                            ? std::numeric_limits<std::uint64_t>::max()
+                                            : pressure_transition.state_images +
+                                                  requirement.units;
+                                }
+                            }
+                        });
+                }
+                break;
+            } catch (const std::bad_alloc&) {
+                // Host placement failed despite the reserve-time fit re-check. The plan raced
+                // a state the planner's simulation does not reproduce. Sweep zero-reference
+                // Host pages and retry the demotes once; a second failure aborts only this
+                // transaction (the request errors cleanly) instead of tearing down the whole
+                // engine, which would fail every in-flight request.
+                (void)cudaStreamSynchronize(device.transfer_stream);
+                for_each_pending_pressure(
+                    [&](MaterializationTransaction::PressureWork& work) {
+                        reset_pressure_work_for_retry(work);
                     });
+                if (host_retried) {
+                    // The plan's demotes cannot be placed even after sweeping. Hand the
+                    // request back to the Engine with its prompt intact so it re-plans
+                    // against the post-abort arena (the evictions this transaction already
+                    // committed and any swept dead content are now free) instead of failing.
+                    const std::uint32_t lane = transaction.destination.value;
+                    RequestControl& lane_request = requests[lane];
+                    if (lane_request.prefill &&
+                        !lane_request.prefill->prompt.token_ids.empty()) {
+                        out.replan_prompt = std::move(lane_request.prefill->prompt);
+                    }
+                    abort_transaction();
+                    return out;
+                }
+                host_retried = true;
+                pressure_transition.timer_mask    = 0;
+                pressure_transition.transfer_work = {};
+                pressure_transition.transfer_pages = {};
+                pressure_transition.state_images   = 0;
+                if (host_kv_extents != nullptr) {
+                    const std::size_t swept = host_kv_extents->release_unreferenced();
+                    std::fprintf(stderr,
+                                 "[HOSTRETRY] demote allocation failed; swept %zu Host bytes\n",
+                                 swept);
+                }
+            } catch (...) {
+                (void)cudaStreamSynchronize(device.transfer_stream);
+                for_each_pending_pressure(
+                    [&](MaterializationTransaction::PressureWork& work) { abort_pressure_work(work); });
+                throw;
             }
-        } catch (...) {
-            (void)cudaStreamSynchronize(device.transfer_stream);
-            for_each_pending_pressure(
-                [&](MaterializationTransaction::PressureWork& work) { abort_pressure_work(work); });
-            throw;
         }
 
         bool copies_submitted = false;

@@ -569,7 +569,12 @@ public:
     root_maximal_target(runtime::PlanningCandidateId root_candidate,
                         std::span<const runtime::PlanningOwnerId> preferred_owner_ids,
                         std::span<const std::uint32_t> preferred_owner_weights);
-    [[nodiscard]] PressureTargetHandle maximal_target(runtime::PlanningCandidateId candidate);
+    [[nodiscard]] PressureTargetHandle
+    maximal_target(runtime::PlanningCandidateId candidate,
+                   std::span<const runtime::PlanningOwnerId> preferred_owner_ids,
+                   std::span<const std::uint32_t> preferred_owner_weights,
+                   std::span<const std::uint64_t> preferred_owner_epochs,
+                   bool shed_live, std::uint64_t global_activity_epoch);
     [[nodiscard]] PressureConstructionCursor begin_construction(PressureTargetHandle target,
                                                                 bool restore = false);
     [[nodiscard]] runtime::PressureConstructionStep
@@ -588,7 +593,8 @@ public:
     deterministic_target(runtime::PlanningCandidateId candidate,
                          std::span<const runtime::PlanningOwnerId> preferred_owner_ids,
                          std::span<const std::uint32_t> preferred_owner_weights,
-                         std::span<const std::uint64_t> preferred_owner_epochs);
+                         std::span<const std::uint64_t> preferred_owner_epochs,
+                         std::uint64_t global_activity_epoch);
     [[nodiscard]] runtime::PressureTargetGuidance guidance(PressureTargetHandle target);
     [[nodiscard]] AssessedPressureTarget assess(PressureTargetHandle target);
     [[nodiscard]] PreparedPressureExpansion
@@ -804,6 +810,10 @@ struct MaterializationResult {
     std::vector<MaterializationSharedVictimResult> shared_victims;
     std::vector<runtime::ContextTransferObservation> transfer_observations;
     runtime::ContextOperationCounts operations;
+    // When a materialization aborts mid-transaction because the Host arena can no longer
+    // place its demotes, the request's prompt is moved back out so the Engine can re-queue
+    // the request for fresh planning against the post-abort arena.
+    std::optional<PreparedPromptData> replan_prompt;
 };
 
 using ContextTransactionProgress =
@@ -953,6 +963,7 @@ public:
     [[nodiscard]] bool isolated_request_feasible(const RequestBasePlan& base) const noexcept;
     [[nodiscard]] runtime::ProgramResourceRevision resource_revision() const noexcept;
     [[nodiscard]] PhysicalUsageSnapshot physical_usage() const noexcept;
+    [[nodiscard]] std::size_t host_kv_capacity_bytes() const noexcept;
     [[nodiscard]] MemorySummary memory_summary() const noexcept;
     void reset_memory_peaks() noexcept;
 

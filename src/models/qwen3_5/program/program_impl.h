@@ -205,6 +205,16 @@ struct ResourceCandidateState {
     // aggregate free bytes are sufficient. Keep the blocked allocation work explicit so a child
     // target can release Host replicas instead of being mistaken for a structurally invalid node.
     std::size_t blocked_host_allocation_bytes = 0;
+    // The composition's Host extent inputs, retained so materialization can re-check the plan
+    // against the CURRENT arena at reserve time (the plan-time answer can go stale while other
+    // materializations commit). Requests reference layouts in host_kv_layouts; both vectors are
+    // built once during composition and never grow afterwards, so the references stay stable.
+    // A composed candidate must never be deep-copied (the copies at seal sites compose the copy
+    // itself, so their references stay self-consistent); move-only use is the rule downstream.
+    std::vector<HostKVPageLayout> host_kv_layouts;
+    std::vector<HostKVAllocationRequest> host_kv_requests;
+    std::vector<HostKVPageReplicaRelease> host_kv_releases;
+    std::vector<HostKVPageReplicaRelease> host_kv_last_reference_releases;
     detail::PhysicalDemand demand;
     // Resources released by consuming this private owner alone. Shared aliases are intentionally
     // absent; complete pressure targets settle their joint reference graph separately.
@@ -556,6 +566,10 @@ public:
     }
 
     [[nodiscard]] qwen3_5::PhysicalUsageSnapshot physical_usage() const noexcept;
+
+    [[nodiscard]] std::size_t host_kv_capacity_bytes() const noexcept {
+        return admission_capacity().host.kv_bytes;
+    }
 
     [[nodiscard]] MemorySummary memory_summary() const noexcept;
 
@@ -1310,7 +1324,11 @@ struct PressurePlanningSessionImpl {
                         std::span<const runtime::PlanningOwnerId> preferred_owner_ids,
                         std::span<const std::uint32_t> preferred_owner_weights);
     [[nodiscard]] qwen3_5::PressureTargetHandle
-    maximal_target(runtime::PlanningCandidateId candidate);
+    maximal_target(runtime::PlanningCandidateId candidate,
+                   std::span<const runtime::PlanningOwnerId> preferred_owner_ids,
+                   std::span<const std::uint32_t> preferred_owner_weights,
+                   std::span<const std::uint64_t> preferred_owner_epochs,
+                   bool shed_live, std::uint64_t global_activity_epoch);
     [[nodiscard]] qwen3_5::PressureConstructionCursor
     begin_construction(qwen3_5::PressureTargetHandle target, bool restore = false);
     [[nodiscard]] runtime::PressureConstructionStep
@@ -1340,7 +1358,8 @@ struct PressurePlanningSessionImpl {
     deterministic_target(runtime::PlanningCandidateId candidate,
                          std::span<const runtime::PlanningOwnerId> preferred_owner_ids,
                          std::span<const std::uint32_t> preferred_owner_weights,
-                         std::span<const std::uint64_t> preferred_owner_epochs);
+                         std::span<const std::uint64_t> preferred_owner_epochs,
+                         std::uint64_t global_activity_epoch);
     [[nodiscard]] runtime::PressureTargetGuidance guidance(qwen3_5::PressureTargetHandle target);
     [[nodiscard]] qwen3_5::AssessedPressureTarget assess(qwen3_5::PressureTargetHandle target);
     [[nodiscard]] qwen3_5::PreparedPressureExpansion

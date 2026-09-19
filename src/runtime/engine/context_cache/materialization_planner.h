@@ -98,9 +98,10 @@ public:
     [[nodiscard]] std::optional<Result>
     plan(Program& program, const PreparedPrompt& prompt,
          const ContextMachineCostModel& machine_cost, std::span<const CandidateInput> candidates,
-         std::uint32_t root_candidate_index, PressureInputsFn&& pressure_inputs,
-         LogicalGoalFn&& logical_goal, FinalScheduleFn&& final_schedule,
-         Clock::time_point planning_started, PlanningAllowance allowance = {}) {
+         std::uint32_t root_candidate_index, std::uint64_t global_activity_epoch,
+         PressureInputsFn&& pressure_inputs, LogicalGoalFn&& logical_goal,
+         FinalScheduleFn&& final_schedule, Clock::time_point planning_started,
+         PlanningAllowance allowance = {}) {
         if (candidates.empty() || root_candidate_index >= candidates.size()) {
             throw std::invalid_argument("materialization planning problem has no root candidate");
         }
@@ -266,14 +267,6 @@ public:
                   });
         std::vector<PlanningOwnerId> preferred_owner_ids;
         preferred_owner_ids.reserve(preferred_owners.size());
-        std::fprintf(stderr, "[PP] val");
-        for (const MaterializationOwnerPolicy* policy : preferred_owners) {
-            std::fprintf(stderr, " %u:%llu:%u:%llu", policy->owner.value,
-                         static_cast<unsigned long long>(policy->selected_hit_count),
-                         policy->private_retention_weight,
-                         static_cast<unsigned long long>(policy->last_hit_epoch));
-        }
-        std::fprintf(stderr, "\n");
         for (const MaterializationOwnerPolicy* policy : preferred_owners) {
             preferred_owner_ids.push_back(policy->owner);
         }
@@ -334,12 +327,8 @@ public:
             const std::optional<PressureTargetHandle> deterministic =
                 session.deterministic_target(candidates[root.candidate_index].id,
                                              preferred_owner_ids, preferred_owner_weights,
-                                             preferred_owner_epochs);
-            if (!deterministic) {
-                std::fprintf(stderr, "[pl] deterministic NULLOPT cand=%u\n",
-                             candidates[root.candidate_index].id.value);
-                continue;
-            }
+                                             preferred_owner_epochs, global_activity_epoch);
+            if (!deterministic) { continue; }
             AssessedPressureTarget assessed            = session.assess(*deterministic);
             const PressureTargetAssessment& assessment = assessed.assessment();
             if (assessment.candidate != candidates[root.candidate_index].id) {
@@ -355,12 +344,7 @@ public:
                 goal = logical_goal(assessment.candidate, assessment.source_mode,
                                     assessment.owner_outcomes);
             }
-            if (!goal) {
-                std::fprintf(stderr, "[pl] DETERMINISTIC INFEASIBLE cand=%u status=%d\n",
-                             candidates[root.candidate_index].id.value,
-                             static_cast<int>(assessment.physical_status));
-                continue;
-            }
+            if (!goal) { continue; }
             if (!incumbent_set || cost.less(incumbent.cost)) {
                 incumbent     = make_incumbent(*deterministic, root.candidate_index, assessment,
                                                std::move(assessed), cost, *goal);
@@ -370,9 +354,48 @@ public:
 
         const std::uint64_t search_elapsed_ns = elapsed_ns(deterministic_started, Clock::now());
         if (!incumbent_set) {
-            std::fprintf(stderr, "[pl] NO FEASIBLE TARGET cand=%u\n",
-                         candidates[root_candidate_index].id.value);
-            return std::nullopt;
+            // Absolute last resort: identity, the dead-only maximal fallback, and the
+            // deterministic planner all failed to produce a feasible plan. Shed every
+            // non-source victim so the request can be served instead of wedging the
+            // pending queue for the full pending timeout. Two-stage: shed DEAD weight
+            // first (recently-hit "live" sessions preserved); escalate to shedding live
+            // sessions only if the dead-only maximal target is itself infeasible. Live
+            // continuations are the reuse base of sessions that will turn again, so
+            // they are destroyed only when dead weight genuinely cannot fit the request.
+            const auto try_saturation = [&](bool shed_live) -> bool {
+                PressureTargetHandle saturation = session.maximal_target(
+                    candidates[root_candidate_index].id, preferred_owner_ids,
+                    preferred_owner_weights, preferred_owner_epochs, shed_live,
+                    global_activity_epoch);
+                AssessedPressureTarget assessed            = session.assess(saturation);
+                const PressureTargetAssessment& assessment = assessed.assessment();
+                std::optional<LogicalGoal> goal;
+                if (assessment.candidate == candidates[root_candidate_index].id &&
+                    assessment.physical_status ==
+                        MaterializationPhysicalStatus::Feasible) {
+                    goal = logical_goal(assessment.candidate, assessment.source_mode,
+                                        assessment.owner_outcomes);
+                }
+                if (!goal) { return false; }
+                ++targets_evaluated;
+                planning_saturating_add(projection_work, assessment.projection_work);
+                const FoldedCost cost =
+                    fold_assessment(candidates[root_candidate_index], assessment,
+                                    pressure.owner_policy, pressure.checkpoint_policy,
+                                    machine_cost);
+                incumbent     = make_incumbent(saturation, root_candidate_index, assessment,
+                                               std::move(assessed), cost, *goal);
+                incumbent_set = true;
+                std::fprintf(stderr, "[pl] SATURATION FALLBACK SELECTED cand=%u%s\n",
+                             candidates[root_candidate_index].id.value,
+                             shed_live ? " (live)" : " (dead-only)");
+                return true;
+            };
+            if (!try_saturation(false) && !try_saturation(true)) {
+                std::fprintf(stderr, "[pl] NO FEASIBLE TARGET cand=%u\n",
+                             candidates[root_candidate_index].id.value);
+                return std::nullopt;
+            }
         }
         if (!incumbent.assessed) {
             AssessedPressureTarget assessed            = session.assess(incumbent.target);
@@ -421,12 +444,13 @@ public:
     [[nodiscard]] std::optional<Result>
     plan(Program& program, const PreparedPrompt& prompt,
          const ContextMachineCostModel& machine_cost, std::span<const CandidateInput> candidates,
-         std::uint32_t root_candidate_index, PressureInputsFn&& pressure_inputs,
-         LogicalGoalFn&& logical_goal, Clock::time_point planning_started,
-         PlanningAllowance allowance = {}) {
+         std::uint32_t root_candidate_index, std::uint64_t global_activity_epoch,
+         PressureInputsFn&& pressure_inputs, LogicalGoalFn&& logical_goal,
+         Clock::time_point planning_started, PlanningAllowance allowance = {}) {
         const auto no_optional_schedule = [](PlanningCandidateId, const RequestPlanSummary&,
                                              const auto&) { return std::vector<std::uint32_t>{}; };
         return plan(program, prompt, machine_cost, candidates, root_candidate_index,
+                    global_activity_epoch,
                     std::forward<PressureInputsFn>(pressure_inputs),
                     std::forward<LogicalGoalFn>(logical_goal), no_optional_schedule,
                     planning_started, allowance);

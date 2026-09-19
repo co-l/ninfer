@@ -165,11 +165,14 @@ public:
             }
             if (!allocation) {
                 rollback();
+                const std::size_t largest = arena_->largest_free_extent();
+                const auto [fe_count, fe_sum] = arena_->free_extent_stats();
                 std::fprintf(stderr,
                              "[host] arena allocate FAIL take=%zu pages=%zu occupied=%zu "
-                             "cap=%zu\n",
+                             "cap=%zu largest=%zu stride=%zu fe=%zu/%zu\n",
                              static_cast<std::size_t>(take), membership.size(),
-                             arena_->occupied_bytes(), arena_->capacity_bytes());
+                             arena_->occupied_bytes(), arena_->capacity_bytes(), largest,
+                             layout.page_stride, fe_count, fe_sum);
                 return std::nullopt;
             }
 

@@ -169,6 +169,9 @@ class PreparedPromptAccess {
 public:
     [[nodiscard]] static const PreparedPromptData& view(const PreparedPrompt& prompt);
     [[nodiscard]] static PreparedPromptData take(PreparedPrompt&& prompt);
+    // Re-wraps data (e.g. a prompt recovered from an aborted materialization) into a
+    // PreparedPrompt for re-planning.
+    [[nodiscard]] static PreparedPrompt adopt(std::unique_ptr<PreparedPromptData> data);
 };
 
 } // namespace ninfer::models::qwen3_5

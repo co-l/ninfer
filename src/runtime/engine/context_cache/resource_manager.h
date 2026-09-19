@@ -1,6 +1,7 @@
 #pragma once
 
 #include "ninfer/types.h"
+#include "models/qwen3_5/frontend/prepared_prompt.h"
 #include "runtime/contract/execution.h"
 #include "runtime/contract/resources.h"
 #include "runtime/engine/context_cache/context_cost.h"
@@ -220,6 +221,7 @@ public:
         ContextTransactionStatus status = ContextTransactionStatus::Aborted;
         std::optional<PublishedActivation> activation;
         MaterializationDiagnostics diagnostics;
+        std::optional<ninfer::models::qwen3_5::PreparedPromptData> replan_prompt;
     };
 
     enum class MaterializationReserveResult : std::uint8_t {
@@ -348,16 +350,7 @@ public:
                     std::optional<AdmissionCandidate> plan =
                         program.inspect_admission(prompt, base, *destination, &*entry.handle,
                                                   nullptr, index.checkpoint, retain);
-                    if (!plan) {
-                        if (base.summary().prompt_tokens > 4096) {
-                            std::fprintf(stderr,
-                                         "[REJ] private slot=%u id=%llu prompt=%u\n",
-                                         index.slot,
-                                         static_cast<unsigned long long>(entry.id),
-                                         base.summary().prompt_tokens);
-                        }
-                        continue;
-                    }
+                    if (!plan) { continue; }
                     if (plan->summary().reusable_prompt_tokens == 0 ||
                         (retain &&
                          plan->identity_assessment().source_mode != PrivateSourceMode::Retain)) {
@@ -420,13 +413,6 @@ public:
             plan_materialization(program, prompt, base, *destination, candidates, publication_order,
                                  planning_started, provisional_demand, allowance);
         if (!selected) { return {.readiness = Readiness::TemporarilyBlocked}; }
-        if (base.summary().prompt_tokens > 4096) {
-            const RequestPlanSummary& summary = selected->summary();
-            std::fprintf(stderr,
-                         "[SEL] prompt=%u reuse=%d reusable=%u candidates=%zu\n",
-                         base.summary().prompt_tokens, static_cast<int>(summary.prefix_reuse_path),
-                         summary.reusable_prompt_tokens, candidates.size());
-        }
         return {
             .readiness = selected->needs_transfer() ? Readiness::NeedsTransfer : Readiness::Ready,
             .choice    = std::move(selected),
@@ -551,6 +537,64 @@ public:
         clear_catalog_entry(entry);
         saturating_increment(context_stats_.pressure_private_owners_evicted);
         return true;
+    }
+
+    // Host-tier reclamation: proactively evict the lowest-value dead retained
+    // continuations once host occupancy passes a high-water mark, so the host
+    // never creeps into the >95% fragmentation regime where the pressure
+    // planner's last resort destroys live sessions to place a demote. Dead only:
+    // live (weight-16) sessions and shared stable prefixes are never reclaimed
+    // here, and anything hit within the staleness window is protected so freshly
+    // hydrated retention content is never the first victim. Oldest dead weight is
+    // shed first (the prior-run backlog), reusing the single-eviction release
+    // path already proven on the capture path. Budgeted per call so the worker
+    // loop spreads the work across boundaries.
+    bool reclaim_dead_host_retained(Program& program) {
+        if (program.has_context_transaction()) { return false; }
+        const auto usage       = program.physical_usage();
+        const std::size_t host = program.host_kv_capacity_bytes();
+        if (host == 0) { return false; }
+        constexpr std::uint64_t kHostHighWaterPercent = 85;
+        if (usage.host_kv_bytes <= host * kHostHighWaterPercent / 100) { return false; }
+        constexpr std::uint64_t kReclaimStalenessWindow = 128;
+        constexpr std::uint32_t kReclaimBudget          = 4;
+        bool reclaimed                                  = false;
+        for (std::uint32_t step = 0; step < kReclaimBudget; ++step) {
+            std::optional<std::uint32_t> victim;
+            std::uint64_t best_weight = std::numeric_limits<std::uint64_t>::max();
+            std::uint64_t best_epoch  = 0;
+            for (std::uint32_t slot = 0; slot < catalog_count_; ++slot) {
+                const CatalogEntry& entry = catalog_[slot];
+                if (entry.state != CatalogState::Catalogued || !entry.handle ||
+                    private_has_active_edge(slot) ||
+                    entry.retention == RetentionClass::SharedStable) {
+                    continue;
+                }
+                const std::uint64_t weight = effective_retention_weight(entry);
+                if (weight >= private_retention_weight(RetentionClass::LiveSession)) { continue; }
+                const std::uint64_t newest = newest_hit_epoch(entry);
+                if (newest != 0 && retention_epoch_ >= newest &&
+                    retention_epoch_ - newest <= kReclaimStalenessWindow) {
+                    continue;
+                }
+                if (!victim || weight < best_weight ||
+                    (weight == best_weight && newest < best_epoch)) {
+                    best_weight = weight;
+                    best_epoch  = newest;
+                    victim      = slot;
+                }
+            }
+            if (!victim) { break; }
+            CatalogEntry& entry = catalog_[*victim];
+            const typename ModelContract::ReleaseResult result =
+                program.release_continuation(std::move(*entry.handle));
+            if (result.status != ConsumeStatus::Consumed) { break; }
+            erase_session_if_owner(entry.id);
+            clear_catalog_entry(entry);
+            saturating_increment(context_stats_.pressure_private_owners_evicted);
+            reclaimed = true;
+        }
+        return reclaimed;
     }
 
     [[nodiscard]] ActiveCaptureReserveResult
@@ -1784,16 +1828,7 @@ private:
         };
         for (std::uint32_t slot = 0; slot < catalog_count_; ++slot) {
             const CatalogEntry& entry = catalog_[slot];
-            if (entry.state != CatalogState::Catalogued || !entry.handle) {
-                if (entry.handle) {
-                    std::fprintf(stderr,
-                                 "[STK] private slot=%u id=%llu rev=%llu state=%d handle=1\n",
-                                 slot, static_cast<unsigned long long>(entry.id),
-                                 static_cast<unsigned long long>(entry.revision),
-                                 static_cast<int>(entry.state));
-                }
-                continue;
-            }
+            if (entry.state != CatalogState::Catalogued || !entry.handle) { continue; }
             if (entry.summary.endpoint) {
                 append(false, slot, entry.id, entry.revision, *entry.summary.endpoint);
             }
@@ -2305,8 +2340,9 @@ private:
         };
 
         std::optional<typename Planner::Result> planned =
-            planner_.plan(program, prompt, cost_model_, candidate_inputs, 0, build_pressure_inputs,
-                          logical_goal, final_schedule, planning_started, allowance);
+            planner_.plan(program, prompt, cost_model_, candidate_inputs, 0, retention_epoch_,
+                          build_pressure_inputs, logical_goal, final_schedule, planning_started,
+                          allowance);
         const auto selected_candidate =
             planned ? std::find_if(candidate_inputs.begin(), candidate_inputs.end(),
                                    [&](const typename Planner::CandidateInput& input) {
@@ -2813,13 +2849,6 @@ private:
         const std::uint32_t dropped =
             dropped_checkpoint_count(entry.summary, result.final_summary, result.disposition);
         if (result.disposition == VictimDisposition::Evicted) {
-            std::fprintf(stderr,
-                         "[ADOPT] private EVICT owner=%llu slot=%u end=%u rew=%u\n",
-                         static_cast<unsigned long long>(claim.capability.owner.id), slot,
-                         entry.summary.endpoint ? entry.summary.endpoint->required_kv.main_frontier
-                                                : 0U,
-                         entry.summary.rewrite ? entry.summary.rewrite->required_kv.main_frontier
-                                               : 0U);
             erase_session_if_owner(claim.capability.owner.id);
             clear_catalog_entry(entry);
             saturating_increment(context_stats_.pressure_private_owners_evicted);
@@ -2830,12 +2859,6 @@ private:
             entry.state = CatalogState::Catalogued;
             return;
         }
-        std::fprintf(stderr,
-                     "[ADOPT] private RETAIN owner=%llu slot=%u end=%u rew=%u committed=1\n",
-                     static_cast<unsigned long long>(claim.capability.owner.id), slot,
-                     entry.summary.endpoint ? entry.summary.endpoint->required_kv.main_frontier
-                                            : 0U,
-                     entry.summary.rewrite ? entry.summary.rewrite->required_kv.main_frontier : 0U);
         assign_continuation_summary(entry.summary, *result.final_summary);
         migrate_observations(entry, *result.final_summary, entry.retention);
         advance_revision(entry.revision);
@@ -3141,7 +3164,10 @@ private:
             lanes_[record->destination.value] = LogicalLaneState::Free;
             transaction_.template emplace<std::monostate>();
             program.finalize_context_transaction();
-            return {.status = ContextTransactionStatus::Aborted};
+            return MaterializationOutcome{
+                .status       = ContextTransactionStatus::Aborted,
+                .replan_prompt = std::move(result.replan_prompt),
+            };
         }
 
         CatalogEntry& publication = catalog_[record->publication_slot];

@@ -111,7 +111,10 @@ continuation, and accept tool-result histories whose original user turn was remo
     {{- raise_exception('No user query found in messages.') }}
 {%- endif %}
 {%- for message in messages %}
-    {%- set content = render_content(message.content, true, message.role in ("system", "developer"))|trim %}
+    {%- set content = render_content(message.content, true, message.role in ("system", "developer")) %}
+    {%- if message.role != "assistant" %}
+        {%- set content = content|trim %}
+    {%- endif %}
     {%- if message.role in ("system", "developer") %}
         {%- if not loop.first %}
             {{- '<|im_start|>system\n' + content + '<|im_end|>\n' }}

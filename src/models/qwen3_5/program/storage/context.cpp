@@ -214,8 +214,6 @@ void ProgramImpl::release_continuation_slot_strict(std::uint32_t index) noexcept
     try {
         if (!can_release_continuation_slot_strict(index)) { std::terminate(); }
     } catch (...) { std::terminate(); }
-    std::fprintf(stderr, "[REL2] program release continuation index=%u gen=%llu\n", index,
-                 static_cast<unsigned long long>(continuation_slots[index].generation));
     SequenceState& sequence = continuation_states[index];
     release_sequence_kv_strict(sequence);
     release_sequence_state_strict(sequence);
